@@ -1,0 +1,301 @@
+// ─── Platform administration, audit, privacy ────────────────────────────────
+
+enum SupportCaseType {
+  COMPLAINT
+  DISPUTE
+  SUPPORT
+  REFUND_REQUEST
+  PROVIDER_REPORT
+}
+
+enum SupportCasePriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum SupportCaseStatus {
+  OPEN
+  IN_PROGRESS
+  AWAITING_REPORTER
+  ESCALATED
+  RESOLVED
+  CLOSED
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+  IN_APP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum ExportStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
+enum AuditOutcome {
+  SUCCESS
+  DENIED
+  FAILURE
+}
+
+enum ConsentScope {
+  PLATFORM_DATA_PROCESSING
+  REPORT_SHARING
+  RECORD_ACCESS_BY_PROVIDER
+  COMMUNICATIONS
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  CONTAINED
+  RESOLVED
+  CLOSED
+}
+
+model SupportCase {
+  id             String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  reference      String              @unique @db.VarChar(24)
+  type           SupportCaseType
+  category       String              @db.VarChar(64)
+  priority       SupportCasePriority @default(MEDIUM)
+  status         SupportCaseStatus   @default(OPEN)
+  subject        String              @db.VarChar(200)
+  description    String              @db.VarChar(5000)
+  reporterUserId String?             @map("reporter_user_id") @db.Uuid
+  providerId     String?             @map("provider_id") @db.Uuid
+  transactionId  String?             @map("transaction_id") @db.Uuid
+  assignedToId   String?             @map("assigned_to_id") @db.Uuid
+  slaDueAt       DateTime?           @map("sla_due_at") @db.Timestamptz(3)
+  resolution     String?             @db.VarChar(5000)
+  resolvedAt     DateTime?           @map("resolved_at") @db.Timestamptz(3)
+  createdById    String?             @map("created_by_id") @db.Uuid
+  version        Int                 @default(1)
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider    Provider?           @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  transaction ServiceTransaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  events      SupportCaseEvent[]
+
+  @@index([status, priority, createdAt(sort: Desc)])
+  @@index([assignedToId, status])
+  @@index([providerId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@map("support_cases")
+}
+
+model SupportCaseEvent {
+  id         String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  caseId     String   @map("case_id") @db.Uuid
+  authorId   String?  @map("author_id") @db.Uuid
+  kind       String   @db.VarChar(24) // COMMENT | STATUS_CHANGE | ASSIGNMENT | ESCALATION
+  body       String?  @db.VarChar(5000)
+  isInternal Boolean  @default(true) @map("is_internal")
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  case SupportCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, createdAt])
+  @@map("support_case_events")
+}
+
+/// Internal note on any entity (provider, user, transaction…).
+model AdminNote {
+  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  subjectType String   @map("subject_type") @db.VarChar(48)
+  subjectId   String   @map("subject_id") @db.Uuid
+  authorId    String   @map("author_id") @db.Uuid
+  body        String   @db.VarChar(5000)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([subjectType, subjectId, createdAt(sort: Desc)])
+  @@map("admin_notes")
+}
+
+model NotificationTemplate {
+  id        String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  key       String              @db.VarChar(96)
+  channel   NotificationChannel
+  locale    String              @default("en") @db.VarChar(8)
+  version   Int                 @default(1)
+  subject   String?             @db.VarChar(200)
+  body      String              @db.VarChar(8000)
+  isActive  Boolean             @default(true) @map("is_active")
+  updatedById String?           @map("updated_by_id") @db.Uuid
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([key, channel, locale, version])
+  @@unique([key, channel, locale], where: raw("is_active"), map: "notification_templates_one_active")
+  @@map("notification_templates")
+}
+
+/// Notification outbox. Rows are written in the same DB transaction as the
+/// business change; a pg-boss worker delivers them. Payload must not contain
+/// clinical details, credentials or full identifiers.
+model Notification {
+  id           String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId       String?             @map("user_id") @db.Uuid
+  channel      NotificationChannel
+  templateKey  String              @map("template_key") @db.VarChar(96)
+  recipient    String              @db.VarChar(200)
+  payload      Json                @default("{}")
+  status       NotificationStatus  @default(QUEUED)
+  attempts     Int                 @default(0)
+  lastError    String?             @map("last_error") @db.VarChar(1000)
+  sentAt       DateTime?           @map("sent_at") @db.Timestamptz(3)
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model PlatformSetting {
+  key         String   @id @db.VarChar(96)
+  value       Json
+  description String?  @db.VarChar(500)
+  isSensitive Boolean  @default(false) @map("is_sensitive")
+  version     Int      @default(1)
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("platform_settings")
+}
+
+model ExportJob {
+  id            String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  exportType    String       @map("export_type") @db.VarChar(64)
+  filters       Json         @default("{}")
+  purpose       String       @db.VarChar(500)
+  status        ExportStatus @default(QUEUED)
+  requestedById String       @map("requested_by_id") @db.Uuid
+  rowCount      Int?         @map("row_count")
+  storageKey    String?      @map("storage_key") @db.VarChar(300)
+  error         String?      @db.VarChar(1000)
+  downloadCount Int          @default(0) @map("download_count")
+  expiresAt     DateTime?    @map("expires_at") @db.Timestamptz(3)
+  startedAt     DateTime?    @map("started_at") @db.Timestamptz(3)
+  completedAt   DateTime?    @map("completed_at") @db.Timestamptz(3)
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([requestedById, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("export_jobs")
+}
+
+/// Append-only audit trail (UPDATE/DELETE blocked by trigger). Metadata is
+/// redacted before insert: no passwords, tokens, clinical content, document
+/// contents or full bank numbers.
+model AuditEvent {
+  id          String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  occurredAt  DateTime     @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  actorUserId String?      @map("actor_user_id") @db.Uuid
+  actorType   String       @default("USER") @map("actor_type") @db.VarChar(16) // USER | SYSTEM | WEBHOOK
+  action      String       @db.VarChar(96)
+  entityType  String       @map("entity_type") @db.VarChar(48)
+  entityId    String?      @map("entity_id") @db.VarChar(64)
+  outcome     AuditOutcome @default(SUCCESS)
+  requestId   String?      @map("request_id") @db.VarChar(64)
+  ipAddress   String?      @map("ip_address") @db.VarChar(64)
+  userAgent   String?      @map("user_agent") @db.VarChar(300)
+  metadata    Json?
+
+  @@index([entityType, entityId, occurredAt(sort: Desc)])
+  @@index([actorUserId, occurredAt(sort: Desc)])
+  @@index([action, occurredAt(sort: Desc)])
+  @@index([occurredAt(sort: Desc), id(sort: Desc)])
+  @@map("audit_events")
+}
+
+/// Every read of sensitive material (reports, prescriptions, identity
+/// documents, payout accounts) is logged here, including denied attempts.
+model SensitiveAccessLog {
+  id           String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  actorUserId  String?  @map("actor_user_id") @db.Uuid
+  resourceType String   @map("resource_type") @db.VarChar(48)
+  resourceId   String   @map("resource_id") @db.Uuid
+  purpose      String   @db.VarChar(300)
+  granted      Boolean
+  requestId    String?  @map("request_id") @db.VarChar(64)
+  accessedAt   DateTime @default(now()) @map("accessed_at") @db.Timestamptz(3)
+
+  @@index([resourceType, resourceId, accessedAt(sort: Desc)])
+  @@index([actorUserId, accessedAt(sort: Desc)])
+  @@map("sensitive_access_logs")
+}
+
+model ConsentRecord {
+  id                String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  patientProfileId  String       @map("patient_profile_id") @db.Uuid
+  grantedByUserId   String       @map("granted_by_user_id") @db.Uuid
+  granteeProviderId String?      @map("grantee_provider_id") @db.Uuid
+  scope             ConsentScope
+  purpose           String       @db.VarChar(500)
+  policyVersion     String       @map("policy_version") @db.VarChar(32)
+  grantedAt         DateTime     @default(now()) @map("granted_at") @db.Timestamptz(3)
+  expiresAt         DateTime?    @map("expires_at") @db.Timestamptz(3)
+  withdrawnAt       DateTime?    @map("withdrawn_at") @db.Timestamptz(3)
+
+  patient PatientProfile @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
+
+  @@index([patientProfileId, scope])
+  @@index([granteeProviderId])
+  @@map("consent_records")
+}
+
+model LegalHold {
+  id          String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  entityType  String    @map("entity_type") @db.VarChar(48)
+  entityId    String    @map("entity_id") @db.Uuid
+  reason      String    @db.VarChar(1000)
+  placedById  String    @map("placed_by_id") @db.Uuid
+  placedAt    DateTime  @default(now()) @map("placed_at") @db.Timestamptz(3)
+  releasedAt  DateTime? @map("released_at") @db.Timestamptz(3)
+  releasedById String?  @map("released_by_id") @db.Uuid
+
+  @@index([entityType, entityId])
+  @@map("legal_holds")
+}
+
+model SecurityIncident {
+  id                  String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  reference           String           @unique @db.VarChar(24)
+  severity            IncidentSeverity
+  status              IncidentStatus   @default(OPEN)
+  title               String           @db.VarChar(200)
+  summary             String           @db.VarChar(5000)
+  detectedAt          DateTime         @map("detected_at") @db.Timestamptz(3)
+  containedAt         DateTime?        @map("contained_at") @db.Timestamptz(3)
+  resolvedAt          DateTime?        @map("resolved_at") @db.Timestamptz(3)
+  personalDataAffected Boolean         @default(false) @map("personal_data_affected")
+  regulatorNotifiedAt DateTime?        @map("regulator_notified_at") @db.Timestamptz(3)
+  createdById         String           @map("created_by_id") @db.Uuid
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([status, severity])
+  @@map("security_incidents")
+}

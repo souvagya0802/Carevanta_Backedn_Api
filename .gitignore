@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+generated/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.tmp/
+storage/
+load/results/
+.vscode/*
+!.vscode/extensions.json

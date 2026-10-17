@@ -1,0 +1,634 @@
+// ─── Healthcare providers ───────────────────────────────────────────────────
+//
+// Shared core (Provider) + type-specific detail tables. A doctor is a Provider of
+// type DOCTOR with exactly one DoctorProfile tied to the doctor's own User; a
+// hospital is a Provider of type HOSPITAL with a FacilityProfile. Doctors are
+// never duplicated per hospital — see DoctorAffiliation in operations.prisma.
+
+enum ProviderType {
+  DOCTOR
+  HOSPITAL
+  CLINIC
+  DIAGNOSTIC_LAB
+  IMAGING_CENTRE
+  PHARMACY
+  AMBULANCE_OPERATOR
+}
+
+/// Lifecycle: DRAFT → SUBMITTED → UNDER_REVIEW → (CHANGES_REQUESTED ↔ UNDER_REVIEW)
+/// → APPROVED | REJECTED; APPROVED ↔ SUSPENDED; any → DEACTIVATED.
+/// Allowed transitions are enforced in src/modules/providers/provider-state.ts.
+enum ProviderStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  CHANGES_REQUESTED
+  APPROVED
+  REJECTED
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum RegionStatus {
+  PLANNED
+  PILOT
+  LIVE
+  PAUSED
+}
+
+enum OwnershipType {
+  PRIVATE
+  GOVERNMENT
+  TRUST_OR_NGO
+  OTHER
+}
+
+enum ProviderMemberRole {
+  OWNER
+  ADMIN
+  STAFF
+  PHARMACIST
+  LAB_TECHNICIAN
+  DISPATCHER
+}
+
+enum MemberStatus {
+  INVITED
+  ACTIVE
+  REMOVED
+}
+
+enum DocumentType {
+  MEDICAL_REGISTRATION_CERTIFICATE
+  DEGREE_CERTIFICATE
+  IDENTITY_PROOF
+  GST_CERTIFICATE
+  CLINICAL_ESTABLISHMENT_REGISTRATION
+  TRADE_LICENSE
+  DRUG_LICENSE
+  PHARMACIST_REGISTRATION
+  NABL_ACCREDITATION
+  AERB_LICENSE
+  PCPNDT_REGISTRATION
+  FIRE_NOC
+  BIOMEDICAL_WASTE_AUTHORISATION
+  VEHICLE_REGISTRATION_CERTIFICATE
+  VEHICLE_INSURANCE
+  VEHICLE_FITNESS_CERTIFICATE
+  VEHICLE_PERMIT
+  DRIVING_LICENSE
+  BANK_PROOF
+  AGREEMENT
+  OTHER
+}
+
+enum DocumentStatus {
+  UPLOADED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  SUPERSEDED
+}
+
+enum VerificationCaseKind {
+  ONBOARDING
+  RENEWAL
+  CHANGE_REQUEST
+  COMPLAINT_TRIGGERED
+  PERIODIC_REVIEW
+}
+
+enum VerificationCaseStatus {
+  OPEN
+  IN_REVIEW
+  AWAITING_PROVIDER
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum VerificationCheckType {
+  IDENTITY
+  PROFESSIONAL_REGISTRATION
+  QUALIFICATION
+  FACILITY_REGISTRATION
+  TAX_REGISTRATION
+  DRUG_LICENSE
+  RADIOLOGY_LICENSE
+  ACCREDITATION
+  VEHICLE_REGISTRATION
+  VEHICLE_INSURANCE
+  ADDRESS
+  BANK_ACCOUNT
+}
+
+enum VerificationCheckStatus {
+  PENDING
+  PASSED
+  FAILED
+  WAIVED
+}
+
+/// How a check was performed. There is no single government API covering every
+/// identifier; most checks start as documented manual reviews.
+enum VerificationMethod {
+  MANUAL_DOCUMENT_REVIEW
+  OFFICIAL_REGISTRY_LOOKUP
+  AUTHORISED_THIRD_PARTY_API
+  ISSUER_CONFIRMATION
+  PHYSICAL_INSPECTION
+}
+
+enum PayoutAccountStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  DISABLED
+}
+
+enum AgreementStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+}
+
+enum ReviewStatus {
+  PENDING_MODERATION
+  PUBLISHED
+  REJECTED
+  HIDDEN
+}
+
+/// Geographic rollout unit. Carevanta launches in Moyna and Tamluk (Purba
+/// Medinipur, West Bengal) and expands region by region.
+model ServiceRegion {
+  id         String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  code       String       @unique @db.VarChar(64)
+  name       String       @db.VarChar(120)
+  district   String       @db.VarChar(80)
+  state      String       @db.VarChar(80)
+  status     RegionStatus @default(PLANNED)
+  launchedAt DateTime?    @map("launched_at") @db.Timestamptz(3)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  locations ProviderLocation[]
+
+  @@map("service_regions")
+}
+
+model Provider {
+  id                 String         @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  type               ProviderType
+  status             ProviderStatus @default(DRAFT)
+  legalName          String         @map("legal_name") @db.VarChar(200)
+  displayName        String         @map("display_name") @db.VarChar(200)
+  slug               String         @unique @db.VarChar(220)
+  description        String?        @db.VarChar(4000)
+  contactEmail       String?        @map("contact_email") @db.Citext
+  contactPhone       String?        @map("contact_phone") @db.VarChar(16)
+  gstin              String?        @db.VarChar(15)
+  registrationNumber String?        @map("registration_number") @db.VarChar(80)
+  isListed           Boolean        @default(false) @map("is_listed")
+  submittedAt        DateTime?      @map("submitted_at") @db.Timestamptz(3)
+  approvedAt         DateTime?      @map("approved_at") @db.Timestamptz(3)
+  approvedById       String?        @map("approved_by_id") @db.Uuid
+  suspendedAt        DateTime?      @map("suspended_at") @db.Timestamptz(3)
+  statusReason       String?        @map("status_reason") @db.VarChar(1000)
+  ratingAverage      Decimal?       @map("rating_average") @db.Decimal(3, 2)
+  ratingCount        Int            @default(0) @map("rating_count")
+  createdById        String?        @map("created_by_id") @db.Uuid
+  version            Int            @default(1)
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  doctorProfile     DoctorProfile?
+  facilityProfile   FacilityProfile?
+  diagnosticProfile DiagnosticProfile?
+  pharmacyProfile   PharmacyProfile?
+  ambulanceProfile  AmbulanceOperatorProfile?
+
+  locations          ProviderLocation[]
+  serviceAreas       ProviderServiceArea[]
+  members            ProviderMember[]
+  documents          ProviderDocument[]
+  verificationCases  VerificationCase[]
+  statusHistory      ProviderStatusHistory[]
+  payoutAccounts     ProviderPayoutAccount[]
+  agreements         ProviderAgreement[]
+  reviews            Review[]
+  departments        FacilityDepartment[]
+  amenities          ProviderAmenity[]
+  services           ProviderService[]
+  doctorAffiliations   DoctorAffiliation[] @relation("AffiliationDoctor")
+  facilityAffiliations DoctorAffiliation[] @relation("AffiliationFacility")
+  doctorSlots          AppointmentSlot[]   @relation("SlotDoctor")
+  doctorSchedules      DoctorSchedule[]    @relation("ScheduleDoctor")
+  appointmentsAsDoctor   Appointment[]     @relation("AppointmentDoctor")
+  appointmentsAsFacility Appointment[]     @relation("AppointmentFacility")
+  diagnosticOrders   DiagnosticOrder[]
+  pharmacyOrders     PharmacyOrder[]
+  inventory          PharmacyInventory[]
+  vehicles           AmbulanceVehicle[]
+  crew               AmbulanceCrewMember[]
+  dispatchAssignments DispatchAssignment[]
+  transactions       ServiceTransaction[]
+  commissionPolicies CommissionPolicy[]
+  ledgerEntries      ProviderLedgerEntry[]
+  settlementItems    SettlementItem[]
+  supportCases       SupportCase[]
+
+  @@index([type, status, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([displayName(ops: raw("gin_trgm_ops"))], type: Gin, map: "providers_display_name_trgm_idx")
+  @@index([gstin], where: raw("gstin IS NOT NULL"))
+  @@map("providers")
+}
+
+model DoctorProfile {
+  providerId          String   @id @map("provider_id") @db.Uuid
+  userId              String   @unique @map("user_id") @db.Uuid
+  gender              String?  @db.VarChar(24)
+  yearsOfExperience   Int?     @map("years_of_experience") @db.SmallInt
+  languages           String[] @default([]) @db.VarChar(32)
+  defaultFeeMinor     BigInt?  @map("default_fee_minor")
+  currency            String   @default("INR") @db.Char(3)
+  bio                 String?  @db.VarChar(4000)
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider       Provider                   @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  user           User                       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  specialities   DoctorSpeciality[]
+  qualifications DoctorQualification[]
+  registrations  ProfessionalRegistration[]
+
+  @@map("doctor_profiles")
+}
+
+model DoctorSpeciality {
+  doctorProviderId String   @map("doctor_provider_id") @db.Uuid
+  specialityId     String   @map("speciality_id") @db.Uuid
+  isPrimary        Boolean  @default(false) @map("is_primary")
+  verified         Boolean  @default(false)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  doctor     DoctorProfile @relation(fields: [doctorProviderId], references: [providerId], onDelete: Cascade)
+  speciality Speciality    @relation(fields: [specialityId], references: [id], onDelete: Restrict)
+
+  @@id([doctorProviderId, specialityId])
+  @@index([specialityId])
+  @@map("doctor_specialities")
+}
+
+model DoctorQualification {
+  id               String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  doctorProviderId String   @map("doctor_provider_id") @db.Uuid
+  degree           String   @db.VarChar(120)
+  institution      String   @db.VarChar(200)
+  yearAwarded      Int?     @map("year_awarded") @db.SmallInt
+  verified         Boolean  @default(false)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  doctor DoctorProfile @relation(fields: [doctorProviderId], references: [providerId], onDelete: Cascade)
+
+  @@index([doctorProviderId])
+  @@map("doctor_qualifications")
+}
+
+/// Registration with a medical council (e.g. West Bengal Medical Council, NMC
+/// National Medical Register). `verifiedAt` is only set through a
+/// VerificationCheck of type PROFESSIONAL_REGISTRATION.
+model ProfessionalRegistration {
+  id                 String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  doctorProviderId   String    @map("doctor_provider_id") @db.Uuid
+  council            String    @db.VarChar(160)
+  registrationNumber String    @map("registration_number") @db.VarChar(64)
+  registrationYear   Int?      @map("registration_year") @db.SmallInt
+  validUntil         DateTime? @map("valid_until") @db.Date
+  verifiedAt         DateTime? @map("verified_at") @db.Timestamptz(3)
+  verifiedById       String?   @map("verified_by_id") @db.Uuid
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  doctor DoctorProfile @relation(fields: [doctorProviderId], references: [providerId], onDelete: Cascade)
+
+  @@unique([council, registrationNumber])
+  @@index([doctorProviderId])
+  @@map("professional_registrations")
+}
+
+/// Hospitals and clinics.
+model FacilityProfile {
+  providerId                    String        @id @map("provider_id") @db.Uuid
+  ownershipType                 OwnershipType @default(PRIVATE) @map("ownership_type")
+  bedCount                      Int?          @map("bed_count")
+  icuBedCount                   Int?          @map("icu_bed_count")
+  hasEmergency                  Boolean       @default(false) @map("has_emergency")
+  isOpen24x7                    Boolean       @default(false) @map("is_open_24x7")
+  establishmentRegistrationNo   String?       @map("establishment_registration_no") @db.VarChar(80)
+  establishmentRegistrationAuth String?       @map("establishment_registration_authority") @db.VarChar(160)
+  accreditations                String[]      @default([]) @db.VarChar(64)
+  createdAt                     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("facility_profiles")
+}
+
+/// Diagnostic laboratories and imaging centres.
+model DiagnosticProfile {
+  providerId                  String   @id @map("provider_id") @db.Uuid
+  offersPathology             Boolean  @default(false) @map("offers_pathology")
+  offersImaging               Boolean  @default(false) @map("offers_imaging")
+  homeCollectionAvailable     Boolean  @default(false) @map("home_collection_available")
+  establishmentRegistrationNo String?  @map("establishment_registration_no") @db.VarChar(80)
+  nablCertificateNo           String?  @map("nabl_certificate_no") @db.VarChar(80)
+  nablScope                   String?  @map("nabl_scope") @db.VarChar(1000)
+  aerbLicenseNo               String?  @map("aerb_license_no") @db.VarChar(80)
+  pcpndtRegistrationNo        String?  @map("pcpndt_registration_no") @db.VarChar(80)
+  typicalTurnaroundHours      Int?     @map("typical_turnaround_hours")
+  createdAt                   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("diagnostic_profiles")
+}
+
+model PharmacyProfile {
+  providerId              String   @id @map("provider_id") @db.Uuid
+  retailDrugLicenseNo     String?  @map("retail_drug_license_no") @db.VarChar(80)
+  wholesaleDrugLicenseNo  String?  @map("wholesale_drug_license_no") @db.VarChar(80)
+  drugLicenseValidUntil   DateTime? @map("drug_license_valid_until") @db.Date
+  pharmacistName          String?  @map("pharmacist_name") @db.VarChar(160)
+  pharmacistRegistrationNo String? @map("pharmacist_registration_no") @db.VarChar(80)
+  homeDeliveryAvailable   Boolean  @default(false) @map("home_delivery_available")
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("pharmacy_profiles")
+}
+
+model AmbulanceOperatorProfile {
+  providerId    String   @id @map("provider_id") @db.Uuid
+  dispatchPhone String?  @map("dispatch_phone") @db.VarChar(16)
+  isOpen24x7    Boolean  @default(false) @map("is_open_24x7")
+  fleetSize     Int?     @map("fleet_size")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("ambulance_operator_profiles")
+}
+
+/// Physical site (branch). Coordinates use numeric(9,6) — roughly 0.1 m
+/// precision. Proximity search uses a bounding-box prefilter on
+/// (latitude, longitude) followed by haversine distance; PostGIS can replace
+/// this when multi-district search volume justifies it (see docs/architecture.md).
+model ProviderLocation {
+  id           String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId   String   @map("provider_id") @db.Uuid
+  regionId     String?  @map("region_id") @db.Uuid
+  name         String   @db.VarChar(160)
+  addressLine1 String   @map("address_line1") @db.VarChar(200)
+  addressLine2 String?  @map("address_line2") @db.VarChar(200)
+  locality     String?  @db.VarChar(120)
+  city         String   @db.VarChar(120)
+  district     String   @db.VarChar(80)
+  state        String   @db.VarChar(80)
+  pincode      String   @db.Char(6)
+  latitude     Decimal? @db.Decimal(9, 6)
+  longitude    Decimal? @db.Decimal(9, 6)
+  phone        String?  @db.VarChar(16)
+  isPrimary    Boolean  @default(false) @map("is_primary")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider       Provider                 @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  region         ServiceRegion?           @relation(fields: [regionId], references: [id], onDelete: SetNull)
+  operatingHours ProviderOperatingHours[]
+  slots          AppointmentSlot[]
+  schedules      DoctorSchedule[]
+  appointments   Appointment[]
+  affiliations   DoctorAffiliation[]
+  services       ProviderService[]
+  inventory      PharmacyInventory[]
+  vehicles       AmbulanceVehicle[]
+
+  @@index([providerId])
+  @@index([regionId])
+  @@index([district, pincode])
+  @@index([latitude, longitude], where: raw("is_active AND latitude IS NOT NULL"))
+  @@unique([providerId], where: raw("is_primary"), map: "provider_locations_one_primary")
+  @@map("provider_locations")
+}
+
+/// Weekly opening hours expressed as minutes from local midnight (IST).
+model ProviderOperatingHours {
+  id          String  @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  locationId  String  @map("location_id") @db.Uuid
+  dayOfWeek   Int     @map("day_of_week") @db.SmallInt // 0 = Sunday
+  opensAtMin  Int     @map("opens_at_min") @db.SmallInt
+  closesAtMin Int     @map("closes_at_min") @db.SmallInt
+  isClosed    Boolean @default(false) @map("is_closed")
+
+  location ProviderLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, dayOfWeek, opensAtMin])
+  @@map("provider_operating_hours")
+}
+
+/// Where a provider delivers services away from its premises (home sample
+/// collection, medicine delivery, ambulance coverage).
+model ProviderServiceArea {
+  id         String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId String   @map("provider_id") @db.Uuid
+  district   String   @db.VarChar(80)
+  pincode    String?  @db.Char(6)
+  purpose    String   @db.VarChar(40) // HOME_COLLECTION | DELIVERY | AMBULANCE
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, purpose, district, pincode])
+  @@index([district, pincode, purpose])
+  @@map("provider_service_areas")
+}
+
+/// A user's authority within a provider organisation. Provider-scoped
+/// permissions are derived from memberRole; they never grant platform access.
+model ProviderMember {
+  id          String             @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId  String             @map("provider_id") @db.Uuid
+  userId      String             @map("user_id") @db.Uuid
+  memberRole  ProviderMemberRole @map("member_role")
+  status      MemberStatus       @default(INVITED)
+  invitedById String?            @map("invited_by_id") @db.Uuid
+  joinedAt    DateTime?          @map("joined_at") @db.Timestamptz(3)
+  removedAt   DateTime?          @map("removed_at") @db.Timestamptz(3)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  user     User     @relation("MemberUser", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([providerId, userId])
+  @@index([userId])
+  @@map("provider_members")
+}
+
+/// Metadata for an uploaded document. The file itself lives in private object
+/// storage under `storageKey`; it is never served from a public URL.
+model ProviderDocument {
+  id             String         @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId     String         @map("provider_id") @db.Uuid
+  documentType   DocumentType   @map("document_type")
+  status         DocumentStatus @default(UPLOADED)
+  storageKey     String         @unique @map("storage_key") @db.VarChar(300)
+  fileName       String         @map("file_name") @db.VarChar(255)
+  mimeType       String         @map("mime_type") @db.VarChar(100)
+  sizeBytes      Int            @map("size_bytes")
+  sha256         String         @db.Char(64)
+  documentNumber String?        @map("document_number") @db.VarChar(80)
+  issuedAt       DateTime?      @map("issued_at") @db.Date
+  expiresAt      DateTime?      @map("expires_at") @db.Date
+  uploadedById   String?        @map("uploaded_by_id") @db.Uuid
+  reviewedById   String?        @map("reviewed_by_id") @db.Uuid
+  reviewedAt     DateTime?      @map("reviewed_at") @db.Timestamptz(3)
+  reviewNote     String?        @map("review_note") @db.VarChar(1000)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  provider Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  checks   VerificationCheck[]
+
+  @@index([providerId, documentType])
+  @@index([expiresAt], where: raw("status = 'ACCEPTED' AND expires_at IS NOT NULL"))
+  @@index([status, createdAt])
+  @@map("provider_documents")
+}
+
+model VerificationCase {
+  id           String                 @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId   String                 @map("provider_id") @db.Uuid
+  kind         VerificationCaseKind   @default(ONBOARDING)
+  status       VerificationCaseStatus @default(OPEN)
+  assignedToId String?                @map("assigned_to_id") @db.Uuid
+  openedById   String?                @map("opened_by_id") @db.Uuid
+  decidedById  String?                @map("decided_by_id") @db.Uuid
+  decidedAt    DateTime?              @map("decided_at") @db.Timestamptz(3)
+  decisionNote String?                @map("decision_note") @db.VarChar(2000)
+  createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  checks   VerificationCheck[]
+
+  @@unique([providerId], where: raw("status = ANY (ARRAY['OPEN'::\"VerificationCaseStatus\", 'IN_REVIEW'::\"VerificationCaseStatus\", 'AWAITING_PROVIDER'::\"VerificationCaseStatus\"])"), map: "verification_cases_one_open_per_provider")
+  @@index([status, createdAt])
+  @@index([assignedToId, status])
+  @@map("verification_cases")
+}
+
+model VerificationCheck {
+  id                 String                  @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  caseId             String                  @map("case_id") @db.Uuid
+  checkType          VerificationCheckType   @map("check_type")
+  status             VerificationCheckStatus @default(PENDING)
+  method             VerificationMethod      @default(MANUAL_DOCUMENT_REVIEW)
+  isRequired         Boolean                 @default(true) @map("is_required")
+  sourceReference    String?                 @map("source_reference") @db.VarChar(500)
+  evidenceDocumentId String?                 @map("evidence_document_id") @db.Uuid
+  checkedById        String?                 @map("checked_by_id") @db.Uuid
+  checkedAt          DateTime?               @map("checked_at") @db.Timestamptz(3)
+  notes              String?                 @db.VarChar(2000)
+  validUntil         DateTime?               @map("valid_until") @db.Date
+  createdAt          DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  case     VerificationCase  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  evidence ProviderDocument? @relation(fields: [evidenceDocumentId], references: [id], onDelete: SetNull)
+
+  @@unique([caseId, checkType])
+  @@map("verification_checks")
+}
+
+model ProviderStatusHistory {
+  id          String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId  String          @map("provider_id") @db.Uuid
+  fromStatus  ProviderStatus? @map("from_status")
+  toStatus    ProviderStatus  @map("to_status")
+  changedById String?         @map("changed_by_id") @db.Uuid
+  reason      String?         @db.VarChar(1000)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, createdAt])
+  @@map("provider_status_history")
+}
+
+/// Bank account for settlements. The full account number is encrypted with
+/// AES-256-GCM (DATA_ENCRYPTION_KEY); only the last four digits are queryable.
+model ProviderPayoutAccount {
+  id                     String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId             String              @map("provider_id") @db.Uuid
+  accountHolderName      String              @map("account_holder_name") @db.VarChar(160)
+  accountNumberEncrypted String              @map("account_number_encrypted") @db.VarChar(512)
+  accountNumberLast4     String              @map("account_number_last4") @db.Char(4)
+  ifsc                   String              @db.Char(11)
+  status                 PayoutAccountStatus @default(PENDING_VERIFICATION)
+  verifiedById           String?             @map("verified_by_id") @db.Uuid
+  verifiedAt             DateTime?           @map("verified_at") @db.Timestamptz(3)
+  createdById            String?             @map("created_by_id") @db.Uuid
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  disabledAt             DateTime?           @map("disabled_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  @@unique([providerId], where: raw("status = 'VERIFIED'"), map: "payout_accounts_one_verified")
+  @@index([providerId])
+  @@map("provider_payout_accounts")
+}
+
+model ProviderAgreement {
+  id              String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId      String          @map("provider_id") @db.Uuid
+  agreementNumber String          @unique @map("agreement_number") @db.VarChar(40)
+  status          AgreementStatus @default(DRAFT)
+  effectiveFrom   DateTime        @map("effective_from") @db.Timestamptz(3)
+  effectiveTo     DateTime?       @map("effective_to") @db.Timestamptz(3)
+  signedAt        DateTime?       @map("signed_at") @db.Timestamptz(3)
+  documentId      String?         @map("document_id") @db.Uuid
+  notes           String?         @db.VarChar(2000)
+  createdById     String?         @map("created_by_id") @db.Uuid
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider Provider           @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  policies CommissionPolicy[]
+
+  @@index([providerId, status])
+  @@map("provider_agreements")
+}
+
+model Review {
+  id            String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  providerId    String       @map("provider_id") @db.Uuid
+  authorUserId  String       @map("author_user_id") @db.Uuid
+  appointmentId String?      @unique @map("appointment_id") @db.Uuid
+  rating        Int          @db.SmallInt
+  comment       String?      @db.VarChar(2000)
+  status        ReviewStatus @default(PENDING_MODERATION)
+  moderatedById String?      @map("moderated_by_id") @db.Uuid
+  moderatedAt   DateTime?    @map("moderated_at") @db.Timestamptz(3)
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, status, createdAt(sort: Desc)])
+  @@map("reviews")
+}

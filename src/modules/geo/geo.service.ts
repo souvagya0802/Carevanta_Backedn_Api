@@ -1,0 +1,114 @@
+import { City, Country, State } from 'country-state-city';
+import { AppError, badRequest, notFound } from '../../lib/errors.js';
+import { logger } from '../../lib/logger.js';
+
+/**
+ * Reference geography. Countries, states and cities come from the
+ * `country-state-city` dataset (ISO 3166); Indian PIN codes resolve through the
+ * India Post directory so district and locality are never typed from memory.
+ * Nothing here is specific to the pilot region — any Indian (or other) address
+ * is supported, and the pilot is just data in `service_regions`.
+ */
+
+export interface GeoCountry { code: string; name: string; phoneCode: string; flag: string }
+export interface GeoState { code: string; name: string; latitude: number | null; longitude: number | null }
+export interface GeoCity { name: string; latitude: number | null; longitude: number | null }
+export interface PincodeResult {
+  pincode: string;
+  country: string;
+  state: string;
+  district: string;
+  /** Administrative block / taluka, a good default for city or town. */
+  block: string | null;
+  division: string | null;
+  /** Post offices serving this PIN — used as locality suggestions. */
+  offices: { name: string; branchType: string }[];
+}
+
+const num = (s: string | null | undefined) => {
+  if (s == null || s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+};
+
+export function listCountries(): GeoCountry[] {
+  return Country.getAllCountries().map((c) => ({ code: c.isoCode, name: c.name, phoneCode: c.phonecode, flag: c.flag }));
+}
+
+export function listStates(countryCode: string): GeoState[] {
+  const cc = countryCode.toUpperCase();
+  if (!Country.getCountryByCode(cc)) throw notFound('Country');
+  return State.getStatesOfCountry(cc)
+    .map((s) => ({ code: s.isoCode, name: s.name, latitude: num(s.latitude), longitude: num(s.longitude) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function listCities(countryCode: string, stateCode: string): GeoCity[] {
+  const cc = countryCode.toUpperCase();
+  const sc = stateCode.toUpperCase();
+  if (!State.getStateByCodeAndCountry(sc, cc)) throw notFound('State');
+  return City.getCitiesOfState(cc, sc)
+    .map((c) => ({ name: c.name, latitude: num(c.latitude), longitude: num(c.longitude) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/* ─── Indian PIN code directory (India Post) ─────────────────────────────── */
+
+const PIN_API = 'https://api.postalpincode.in/pincode/';
+const PIN_TTL_MS = 24 * 60 * 60 * 1000;
+const PIN_CACHE_MAX = 5000;
+const pinCache = new Map<string, { at: number; value: PincodeResult | null }>();
+
+interface IndiaPostOffice { Name: string; BranchType: string; District: string; Division: string | null; Block: string | null; State: string; Country: string }
+interface IndiaPostResponse { Status: string; PostOffice: IndiaPostOffice[] | null }
+
+function remember(pin: string, value: PincodeResult | null) {
+  if (pinCache.size >= PIN_CACHE_MAX) pinCache.delete(pinCache.keys().next().value!);
+  pinCache.set(pin, { at: Date.now(), value });
+}
+
+export async function lookupPincode(raw: string, fetchImpl: typeof fetch = fetch): Promise<PincodeResult> {
+  const pin = raw.trim();
+  if (!/^[1-9][0-9]{5}$/.test(pin)) throw badRequest('A PIN code is six digits and cannot start with 0');
+  const hit = pinCache.get(pin);
+  if (hit && Date.now() - hit.at < PIN_TTL_MS) {
+    if (!hit.value) throw notFound('PIN code');
+    return hit.value;
+  }
+  let body: IndiaPostResponse[];
+  try {
+    const res = await fetchImpl(`${PIN_API}${pin}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    body = (await res.json()) as IndiaPostResponse[];
+  } catch (err) {
+    logger.warn({ err, pin }, 'PIN code directory unavailable');
+    throw new AppError(503, 'SERVICE_UNAVAILABLE', 'The PIN code directory is not reachable right now; fill the address manually');
+  }
+  const offices = body[0]?.PostOffice ?? null;
+  if (body[0]?.Status !== 'Success' || !offices?.length) {
+    remember(pin, null);
+    throw notFound('PIN code');
+  }
+  const first = offices[0]!;
+  const mode = (pick: (o: IndiaPostOffice) => string | null) => {
+    const counts = new Map<string, number>();
+    for (const o of offices) { const v = pick(o); if (v) counts.set(v, (counts.get(v) ?? 0) + 1); }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  };
+  const value: PincodeResult = {
+    pincode: pin,
+    country: first.Country,
+    state: first.State,
+    district: mode((o) => o.District) ?? first.District,
+    block: mode((o) => (o.Block && o.Block !== 'NA' ? o.Block : null)),
+    division: first.Division ?? null,
+    offices: offices.map((o) => ({ name: o.Name, branchType: o.BranchType })).sort((a, b) => a.name.localeCompare(b.name)),
+  };
+  remember(pin, value);
+  return value;
+}
+
+/** Test hook. */
+export function clearPincodeCache() {
+  pinCache.clear();
+}
