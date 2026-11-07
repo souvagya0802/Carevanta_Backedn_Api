@@ -8,6 +8,9 @@ import { getObject, IMAGE_TYPES, putObject } from '../../lib/storage.js';
 import { sensitiveLimiter } from '../../middleware/rate-limit.js';
 import { getBranding, getSmtpConfig, saveSmtpConfig, sendEmail, setSetting, verifySmtp } from './integrations.service.js';
 import { abdmSession, connectorStatus, getRegistryConnectors, saveRegistryConnectors } from '../providers/registries.service.js';
+import { getPaymentConfig, publicPaymentConfig, savePaymentGateway, setActiveGateway, testGateway } from '../finance/payment-config.service.js';
+import { generateVapidKeys, pushStatus, sendPushToUser, setPushSubject } from '../notifications/push.service.js';
+import { env } from '../../config/env.js';
 
 const MAX_LOGO_BYTES = 2 * 1024 * 1024;
 
@@ -183,6 +186,164 @@ export function integrationsRouter(): Router {
         if (err instanceof AppError) throw err;
         const message = err instanceof Error ? err.message : String(err);
         throw new AppError(422, 'PRECONDITION_FAILED', `SMTP test failed: ${message.slice(0, 300)}`);
+      }
+    },
+  });
+
+  // ── Payment gateways (Razorpay, Stripe) ───────────────────────────────────
+  const GatewayDto = z.object({ enabled: z.boolean(), mode: z.enum(['test', 'live']), publicKey: z.string().nullable(), hasSecretKey: z.boolean(), secretKeyHint: z.string().nullable(), hasWebhookSecret: z.boolean() });
+  const PaymentsDto = z.object({ activeGateway: z.enum(['NONE', 'RAZORPAY', 'STRIPE']), razorpay: GatewayDto, stripe: GatewayDto, webhookUrls: z.object({ razorpay: z.string(), stripe: z.string() }) });
+  const hint = (s: string | null) => (s ? `••••${s.slice(-4)}` : null);
+  const paymentsDto = async () => {
+    const c = await getPaymentConfig();
+    const g = (x: typeof c.razorpay) => ({ enabled: x.enabled, mode: x.mode, publicKey: x.publicKey, hasSecretKey: !!x.secretKey, secretKeyHint: hint(x.secretKey), hasWebhookSecret: !!x.webhookSecret });
+    return { activeGateway: c.activeGateway, razorpay: g(c.razorpay), stripe: g(c.stripe), webhookUrls: { razorpay: `${env.PUBLIC_API_URL ?? ''}/api/v1/webhooks/razorpay`, stripe: `${env.PUBLIC_API_URL ?? ''}/api/v1/webhooks/stripe` } };
+  };
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'get',
+    path: '/payments',
+    summary: 'Payment gateway configuration (secrets never returned)',
+    tags: ['Admin · Settings'],
+    permissions: ['settings.read'],
+    response: PaymentsDto,
+    handler: () => paymentsDto(),
+  });
+
+  // Registered before `/payments/:gateway` so "active" is never read as a gateway name.
+  defineRoute(r, '/admin/integrations', {
+    method: 'put',
+    path: '/payments/active',
+    summary: 'Choose which gateway patients pay through (or none)',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    middleware: [sensitiveLimiter],
+    body: z.object({ gateway: z.enum(['NONE', 'RAZORPAY', 'STRIPE']), reason: z.string().trim().min(5).max(500) }),
+    response: PaymentsDto,
+    handler: async ({ body, auth }) => {
+      await prisma.$transaction(async (tx) => {
+        await setActiveGateway(tx, body.gateway, auth.userId);
+        await audit(tx, { action: 'payments.active_gateway_changed', entityType: 'platform_setting', entityId: 'payments.active_gateway', metadata: { gateway: body.gateway, reason: body.reason } });
+      });
+      return paymentsDto();
+    },
+  });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'put',
+    path: '/payments/:gateway',
+    summary: 'Save keys for Razorpay or Stripe',
+    description: 'Omit `secretKey` / `webhookSecret` to keep the stored value; send an empty string to clear it. Keys are checked against the gateway’s published formats and the selected mode.',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    middleware: [sensitiveLimiter],
+    params: z.object({ gateway: z.enum(['razorpay', 'stripe']) }),
+    body: z.object({ enabled: z.boolean(), mode: z.enum(['test', 'live']), publicKey: z.string().trim().max(200).nullable(), secretKey: z.string().trim().max(200).nullable().optional(), webhookSecret: z.string().trim().max(200).nullable().optional() }),
+    response: PaymentsDto,
+    handler: async ({ params, body, auth }) => {
+      const gateway = params.gateway === 'razorpay' ? 'RAZORPAY' : 'STRIPE';
+      await prisma.$transaction(async (tx) => {
+        await savePaymentGateway(tx, gateway, body, auth.userId);
+        await audit(tx, { action: 'payments.gateway_configured', entityType: 'platform_setting', entityId: `payments.${params.gateway}`, metadata: { enabled: body.enabled, mode: body.mode, publicKey: body.publicKey, secretChanged: body.secretKey !== undefined, webhookSecretChanged: body.webhookSecret !== undefined } });
+      });
+      return paymentsDto();
+    },
+  });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'post',
+    path: '/payments/:gateway/test',
+    summary: 'Call the gateway with the saved keys (read-only; nothing is charged)',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    middleware: [sensitiveLimiter],
+    params: z.object({ gateway: z.enum(['razorpay', 'stripe']) }),
+    response: z.object({ ok: z.boolean(), account: z.string(), mode: z.string(), detail: z.string() }),
+    handler: async ({ params, auth }) => {
+      const result = await testGateway(params.gateway === 'razorpay' ? 'RAZORPAY' : 'STRIPE');
+      await audit(prisma, { action: 'payments.gateway_tested', entityType: 'platform_setting', entityId: `payments.${params.gateway}`, actorUserId: auth.userId, metadata: { mode: result.mode } });
+      return result;
+    },
+  });
+
+  defineRoute(r, '/public', {
+    method: 'get',
+    path: '/payments',
+    summary: 'Which gateway is live and its public key (for the patient app checkout)',
+    tags: ['Public'],
+    auth: 'none',
+    response: z.object({ activeGateway: z.string(), mode: z.string().nullable(), publicKey: z.string().nullable(), enabled: z.object({ razorpay: z.boolean(), stripe: z.boolean() }) }),
+    handler: () => publicPaymentConfig(),
+  });
+
+  // ── Web Push (VAPID) ───────────────────────────────────────────────────────
+  const PushDto = z.object({ configured: z.boolean(), publicKey: z.string().nullable(), subject: z.string().nullable(), subscriptions: z.number().int(), subscribedUsers: z.number().int() });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'get',
+    path: '/push',
+    summary: 'Web Push status: whether VAPID keys exist and how many devices are subscribed',
+    tags: ['Admin · Settings'],
+    permissions: ['settings.read'],
+    response: PushDto,
+    handler: () => pushStatus(),
+  });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'post',
+    path: '/push/generate',
+    summary: 'Generate a new VAPID key pair (every device must subscribe again)',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    middleware: [sensitiveLimiter],
+    body: z.object({ subject: z.string().trim().min(6).max(200), confirm: z.literal(true) }),
+    response: PushDto,
+    handler: async ({ body, auth }) => {
+      await prisma.$transaction(async (tx) => {
+        await generateVapidKeys(tx, body.subject, auth.userId);
+        await audit(tx, { action: 'push.vapid_generated', entityType: 'platform_setting', entityId: 'push.vapid', metadata: { subject: body.subject } });
+      });
+      return pushStatus();
+    },
+  });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'put',
+    path: '/push',
+    summary: 'Change the VAPID contact subject',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    body: z.object({ subject: z.string().trim().min(6).max(200) }),
+    response: PushDto,
+    handler: async ({ body, auth }) => {
+      await prisma.$transaction(async (tx) => {
+        await setPushSubject(tx, body.subject, auth.userId);
+        await audit(tx, { action: 'push.subject_changed', entityType: 'platform_setting', entityId: 'push.vapid.subject', metadata: { subject: body.subject } });
+      });
+      return pushStatus();
+    },
+  });
+
+  defineRoute(r, '/admin/integrations', {
+    method: 'post',
+    path: '/push/test',
+    summary: 'Send a test push to every device you have subscribed',
+    tags: ['Admin · Settings'],
+    status: 200,
+    permissions: ['settings.manage'],
+    middleware: [sensitiveLimiter],
+    response: z.object({ ok: z.boolean(), devices: z.number().int() }),
+    handler: async ({ auth }) => {
+      try {
+        const devices = await sendPushToUser(auth.userId, { title: 'Carevanta push test', body: 'Push notifications are working on this device.', link: '/' });
+        return { ok: true, devices };
+      } catch (err) {
+        throw new AppError(422, 'PRECONDITION_FAILED', `Push test failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
   });

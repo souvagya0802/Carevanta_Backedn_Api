@@ -1,4 +1,4 @@
-import { prisma, Prisma } from '../../lib/prisma.js';
+import { prisma, isDuplicateKey } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, notFound, preconditionFailed } from '../../lib/errors.js';
 import { istDateRange, istToUtc } from '../../lib/time.js';
@@ -52,6 +52,26 @@ export async function createSchedule(actor: AuthContext, input: ScheduleInput) {
   const fee = input.feeMinor ?? minor(ctx.affiliation?.consultationFeeMinor) ?? minor(ctx.doctor.doctorProfile!.defaultFeeMinor);
   if (fee == null) throw badRequest('No fee given and no default fee on the affiliation or doctor profile');
   return prisma.$transaction(async (tx) => {
+    // A doctor cannot be in two sessions at once, at this place or any other.
+    const validFrom = new Date(input.validFrom);
+    const validTo = input.validTo ? new Date(input.validTo) : null;
+    const clash = await tx.doctorSchedule.findFirst({
+      where: {
+        doctorProviderId: input.doctorProviderId,
+        dayOfWeek: input.dayOfWeek,
+        isActive: true,
+        startMinute: { lt: input.endMinute },
+        endMinute: { gt: input.startMinute },
+        OR: [{ validTo: null }, { validTo: { gte: validFrom } }],
+        ...(validTo ? { validFrom: { lte: validTo } } : {}),
+      },
+      include: { location: { select: { name: true } } },
+    });
+    if (clash) {
+      const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+      const day = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][input.dayOfWeek];
+      throw conflict(`This overlaps the doctor's ${day} session ${hhmm(clash.startMinute)}–${hhmm(clash.endMinute)} at ${clash.location.name}. Change the time or stop that session first.`);
+    }
     const s = await tx.doctorSchedule.create({
       data: {
         doctorProviderId: input.doctorProviderId,
@@ -126,7 +146,7 @@ export async function generateSlots(actor: AuthContext, scheduleId: string, from
   const validFrom = isoDate(s.validFrom)!;
   const validTo = isoDate(s.validTo);
   const now = Date.now();
-  const rows: Prisma.Sql[] = [];
+  const rows: { startsAt: Date; endsAt: Date }[] = [];
   for (const day of days) {
     if (day < validFrom || (validTo && day > validTo)) continue;
     const weekday = new Date(`${day}T00:00:00Z`).getUTCDay();
@@ -135,17 +155,38 @@ export async function generateSlots(actor: AuthContext, scheduleId: string, from
       const startsAt = istToUtc(day, m);
       if (startsAt.getTime() <= now) continue;
       const endsAt = new Date(startsAt.getTime() + s.slotMinutes * 60_000);
-      rows.push(
-        Prisma.sql`(${s.doctorProviderId}::uuid, ${s.locationId}::uuid, ${s.affiliationId}::uuid, ${s.id}::uuid, ${startsAt}::timestamptz, ${endsAt}::timestamptz, ${s.capacityPerSlot}::smallint, ${s.feeMinor ?? 0n}::bigint)`,
-      );
+      rows.push({ startsAt, endsAt });
     }
   }
   if (rows.length === 0) return { created: 0, skipped: 0 };
   if (rows.length > 5000) throw badRequest('Too many slots in one request; use a shorter range');
-  const created = await prisma.$executeRaw`
-    INSERT INTO appointment_slots (doctor_provider_id, location_id, affiliation_id, schedule_id, starts_at, ends_at, capacity, fee_minor, updated_at)
-    SELECT v.*, now() FROM (VALUES ${Prisma.join(rows)}) AS v
-    ON CONFLICT DO NOTHING`;
+  const first = rows[0]!.startsAt;
+  const last = rows[rows.length - 1]!.endsAt;
+  // Anything already on this doctor's calendar in the window, at any facility: a new slot that overlaps it is
+  // skipped, never double-booked (this replaces the PostgreSQL EXCLUDE constraint and ON CONFLICT DO NOTHING).
+  const existing = await prisma.appointmentSlot.findMany({
+    where: { doctorProviderId: s.doctorProviderId, startsAt: { lt: last }, endsAt: { gt: first } },
+    select: { startsAt: true, endsAt: true },
+  });
+  const fresh = rows.filter((r) => !existing.some((e) => e.startsAt < r.endsAt && e.endsAt > r.startsAt));
+  const toRow = (r: { startsAt: Date; endsAt: Date }) => ({ doctorProviderId: s.doctorProviderId, locationId: s.locationId, affiliationId: s.affiliationId, scheduleId: s.id, startsAt: r.startsAt, endsAt: r.endsAt, capacity: s.capacityPerSlot, feeMinor: s.feeMinor ?? 0n });
+  let created = 0;
+  if (fresh.length) {
+    try {
+      created = (await prisma.appointmentSlot.createMany({ data: fresh.map(toRow) })).count;
+    } catch (err) {
+      // A concurrent generation inserted some of these: fall back to one-by-one, skipping duplicates.
+      if (!isDuplicateKey(err)) throw err;
+      for (const r of fresh) {
+        try {
+          await prisma.appointmentSlot.create({ data: toRow(r) });
+          created++;
+        } catch (e) {
+          if (!isDuplicateKey(e)) throw e;
+        }
+      }
+    }
+  }
   await audit(prisma, { action: 'schedule.slots_generated', entityType: 'doctor_schedule', entityId: s.id, actorUserId: actor.userId, metadata: { from, to, created, skipped: rows.length - created } });
   return { created, skipped: rows.length - created };
 }
@@ -202,6 +243,9 @@ export async function setSlotStatus(actor: AuthContext, slotId: string, status: 
     if (!s) throw notFound('Slot');
     if (s.status === 'CANCELLED') throw conflict('Cancelled slots cannot be changed');
     if (s.status === status) throw conflict(`Slot is already ${status}`);
+    // Blocking hides the slot from patients; a slot with live bookings must have them cancelled or moved first,
+    // otherwise a patient holds an appointment in a slot nobody can see.
+    if (status === 'BLOCKED' && s.bookedCount > 0) throw conflict(`${s.bookedCount} patient${s.bookedCount > 1 ? 's are' : ' is'} booked in this slot; cancel or reschedule them first`);
     const updated = await tx.appointmentSlot.update({ where: { id: slotId }, data: { status, version: { increment: 1 } } });
     await audit(tx, { action: status === 'BLOCKED' ? 'slot.blocked' : 'slot.opened', entityType: 'appointment_slot', entityId: slotId, actorUserId: actor.userId, metadata: { bookedCount: s.bookedCount } });
     return slotDto(updated);

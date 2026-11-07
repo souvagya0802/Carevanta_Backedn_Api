@@ -4,7 +4,7 @@ Date: 2026-10-17 · Repositories: `Carevanta_Backedn_Api` (API, worker, schema, 
 
 ## 1. What was implemented
 
-**Backend (Node 22 · TypeScript strict · Express 5 · Prisma 7.10.1 · PostgreSQL 18 on Neon · pg-boss)** — a modular monolith with 17 modules:
+**Backend (Node 22 · TypeScript strict · Express 5 · Prisma 6.19 (MongoDB connector) · MongoDB 8 on Atlas · croner jobs)** — a modular monolith with 17 modules:
 
 | Module | Delivered |
 |---|---|
@@ -29,7 +29,7 @@ Date: 2026-10-17 · Repositories: `Carevanta_Backedn_Api` (API, worker, schema, 
 
 ## 2. Architecture and schema summary
 
-See `docs/architecture.md` and `docs/database.md`. Highlights: single PostgreSQL database with UUIDv7 keys; ~70 models across 6 schema files; integrity that Prisma cannot express lives in SQL migrations (CHECK, two EXCLUDE constraints, scope-key trigger, append-only/immutability triggers); money is BigInt minor units; every list is keyset-paginated with a matching composite index.
+See `docs/architecture.md` and `docs/database.md`. Highlights: single MongoDB replica set with UUIDv7 string keys; 83 models across 7 schema files; invariants PostgreSQL used to enforce now live in partial unique indexes (`src/lib/mongo-indexes.ts`) and service guards (see `docs/database.md`).
 
 ## 3. APIs completed
 
@@ -39,16 +39,14 @@ See `docs/architecture.md` and `docs/database.md`. Highlights: single PostgreSQL
 
 All navigation areas from the brief: overview dashboard (welcome banner, colourful KPI cards, revenue bars, live activity feed, quick actions, pending-action tiles, stacked status charts), user management, doctors/hospitals/clinics/labs/imaging/pharmacies/ambulance, provider applications and credential verification, affiliations, departments/specialities/services/medicines, appointments, pharmacy orders, diagnostic orders and reports, dispatch, payments and refunds, commission rules (with preview calculator), settlements, complaints, notifications, reports and exports, roles and permissions, audit logs, platform settings (+ branding with configurable logo, SMTP email configuration with test send, regions, legal holds, incidents). README in the dashboard repo.
 
-## 5. Migrations created
+## 5. Schema deployment
 
-| Migration | Content |
+| Step | Content |
 |---|---|
-| `20261017000000_init` | complete schema (82 tables, enums, indexes, extensions) |
-| `20261017000100_integrity_constraints` | CHECK/EXCLUDE constraints, triggers, maker-checker checks |
-| `20261017000200_completed_at_index` | widened completion-time index found via query-plan review |
-| `20261017000300_slot_starts_at_index` | `appointment_slots(starts_at)` for time-window reports, found via load test |
+| `npm run db:sync` | creates every collection index: schema manifest (198) + partial indexes (also run at API start) |
+| `npm run db:seed` | reference data, idempotent |
 
-Applied to Neon (`prisma migrate status`: up to date) together with the reference seed (24 specialities, 20 conditions with pending clinical mappings, 14 departments, 14 amenities, 12 services, 8 templates, 7 settings, 2 pilot regions). No user accounts exist on Neon; create the first super-admin with `npm run admin:bootstrap` (prints a one-time token; never a password).
+Applied to Atlas (`npm run db:sync`, `npm run db:seed`) together with the reference seed (24 specialities, 20 conditions with pending clinical mappings, 14 departments, 14 amenities, 12 services, 8 templates, 7 settings, 2 pilot regions). No user accounts exist on Neon; create the first super-admin with `npm run admin:bootstrap` (prints a one-time token; never a password).
 
 ## 6. Tests actually executed
 
@@ -56,7 +54,7 @@ Applied to Neon (`prisma migrate status`: up to date) together with the referenc
 |---|---|---|
 | Backend type-check | `npm run typecheck` | pass (TypeScript 6.0) |
 | Backend lint | `npm run lint` | pass |
-| Backend tests (unit + integration on embedded PostgreSQL 18, migrations applied from empty DB each run) | `npm test` | **11 files, 113 tests passed** (164 s) |
+| Backend tests (unit + integration on an in-memory MongoDB replica set, indexes created from empty each run) | `npm test` | **28 files, 198 tests passed** (211 s, 2026-11-07, after the MongoDB migration) |
 | Backend build | `npm run build` | pass |
 | Schema drift (`migrate diff` DB vs schema after deploy) | manual | empty |
 | Dashboard type-check / lint | `npm run typecheck`, `npm run lint` | pass (2 React-Compiler library warnings) |
@@ -67,7 +65,7 @@ Details and scenario coverage in `docs/testing.md`. Not run: live Razorpay sandb
 
 ## 7. Performance
 
-Measured with the reproducible harness (`node load/local-bench.mjs`): embedded PostgreSQL 18, ~3.6 M synthetic rows (1 M slots, 500 k appointments, 500 k transactions, 1 M audit events, 110 k users), autocannon at 25 connections, EXPLAIN ANALYZE on 14 critical queries. Result: 10 of 11 scenarios within p95 ≤ 250–300 ms / p99 ≤ 600 ms with 0 % errors; `auth.me` p95 313 ms (fix identified: single-query session lookup); all request-path queries on index plans. Four schema/code fixes came out of the measurements (two indexes, search predicate, analytics cache). Numbers, methodology, invalid runs and limitations are in `docs/performance.md`. This is a single-laptop measurement, not a production capacity claim.
+Measured **before the MongoDB migration** (historical, PostgreSQL 18; to be redone on MongoDB) with the reproducible harness (`node load/local-bench.mjs`): embedded PostgreSQL 18, ~3.6 M synthetic rows (1 M slots, 500 k appointments, 500 k transactions, 1 M audit events, 110 k users), autocannon at 25 connections, EXPLAIN ANALYZE on 14 critical queries. Result: 10 of 11 scenarios within p95 ≤ 250–300 ms / p99 ≤ 600 ms with 0 % errors; `auth.me` p95 313 ms (fix identified: single-query session lookup); all request-path queries on index plans. Four schema/code fixes came out of the measurements (two indexes, search predicate, analytics cache). Numbers, methodology, invalid runs and limitations are in `docs/performance.md`. This is a single-laptop measurement, not a production capacity claim.
 
 ## 8. Security measures
 
@@ -75,7 +73,7 @@ Measured with the reproducible harness (`node load/local-bench.mjs`): embedded P
 
 ## 9. Environment, setup and deployment
 
-`docs/operations.md`: local setup, env reference (`.env.example`), bootstrap, deployment order (migrate → API → one worker), Neon pooling, logging/alerting, backups and restore drills, incident response, scheduled jobs. **Rotate the Neon password before any real data** — it was shared in the brief.
+`docs/operations.md`: local setup, env reference (`.env.example`), bootstrap, deployment order (db:sync → API → one worker), Atlas connections, logging/alerting, backups and restore drills, incident response, scheduled jobs. **Rotate the Neon password before any real data** — it was shared in the brief.
 
 ## 10. Known gaps and required decisions
 

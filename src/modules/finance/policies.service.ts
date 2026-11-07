@@ -149,6 +149,24 @@ export async function activatePolicy(actor: AuthContext, id: string, supersede: 
       }
       if (p.legalReviewStatus === 'REJECTED') throw preconditionFailed('Legal review rejected this policy');
 
+      // No two ACTIVE policies may cover the same scope (category + provider type + provider) at the same time.
+      // PostgreSQL enforced this with an EXCLUDE constraint; here it is checked inside the activation transaction.
+      const clashes = await tx.commissionPolicy.findMany({
+        where: {
+          id: { not: p.id },
+          status: 'ACTIVE',
+          category: p.category,
+          providerType: p.providerType,
+          providerId: p.providerId,
+          ...(p.effectiveTo ? { effectiveFrom: { lt: p.effectiveTo } } : {}),
+          OR: [{ effectiveTo: null }, { effectiveTo: { gt: p.effectiveFrom } }],
+        },
+        select: { id: true, effectiveFrom: true, effectiveTo: true },
+      });
+      // Supersede can only close policies that started earlier; anything starting inside the new period still clashes.
+      const unresolvable = clashes.filter((o) => !supersede || o.effectiveFrom >= p.effectiveFrom);
+      if (unresolvable.length) throw conflict('Another ACTIVE policy covers the same scope and period; use supersede or adjust dates', { policyIds: unresolvable.map((o) => o.id) });
+
       if (supersede) {
         const overlapping = await tx.commissionPolicy.findMany({
           where: {

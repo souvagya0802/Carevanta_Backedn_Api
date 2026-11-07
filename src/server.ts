@@ -1,11 +1,25 @@
 import { createServer } from 'node:http';
-import { createApp, markShuttingDown } from './app.js';
+import { createApp, markIndexesReady, markShuttingDown } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './lib/logger.js';
+import { ensureIndexes } from './lib/mongo-indexes.js';
 import { prisma } from './lib/prisma.js';
 
 const app = createApp();
 const server = createServer(app);
+
+// Index sync runs after the socket is open so a code reload never leaves the port dark (the sync is a few
+// hundred round-trips on Atlas). /health/ready answers 503 "starting" until it has finished, and the
+// process exits if it fails: the partial unique indexes enforce "one live row per …" invariants.
+void ensureIndexes(prisma)
+  .then(({ created }) => {
+    markIndexesReady();
+    logger.info({ indexes: created }, 'MongoDB indexes ensured');
+  })
+  .catch((err: unknown) => {
+    logger.fatal({ err }, 'could not create MongoDB indexes');
+    process.exit(1);
+  });
 
 // Bound slow clients and keep-alive behind a load balancer.
 server.requestTimeout = 30_000;

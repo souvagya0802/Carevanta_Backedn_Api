@@ -5,6 +5,8 @@ import { prisma } from '../../lib/prisma.js';
 import { notFound } from '../../lib/errors.js';
 import { DateTimeString, minor } from '../../http/dto.js';
 import { search } from './discovery.service.js';
+import { MIN_LEAD_MS } from '../appointments/appointments.service.js';
+import { smartSearch } from './smart-search.js';
 
 export function discoveryRouter(): Router {
   const r = Router();
@@ -18,6 +20,8 @@ export function discoveryRouter(): Router {
     locationName: z.string(),
     locality: z.string().nullable(),
     city: z.string(),
+    latitude: z.number().nullable(),
+    longitude: z.number().nullable(),
     distanceKm: z.number().nullable(),
     feeMinor: z.number().int().nullable(),
   });
@@ -63,13 +67,15 @@ export function discoveryRouter(): Router {
     handler: async ({ params, query }) => {
       const doctor = await prisma.provider.findFirst({ where: { id: params.id, type: 'DOCTOR', status: 'APPROVED', isListed: true } });
       if (!doctor) throw notFound('Doctor');
-      const from = query.from ? new Date(query.from) : new Date();
+      // Never offer a slot that cannot be booked online any more (it would fail with 409).
+      const earliest = new Date(Date.now() + MIN_LEAD_MS);
+      const from = query.from && new Date(query.from) > earliest ? new Date(query.from) : earliest;
       const to = query.to ? new Date(query.to) : new Date(from.getTime() + 14 * 86_400_000);
       const slots = await prisma.appointmentSlot.findMany({
         where: {
           doctorProviderId: params.id,
           status: 'OPEN',
-          startsAt: { gte: from > new Date() ? from : new Date(), lte: to },
+          startsAt: { gte: from, lte: to },
           ...(query.locationId ? { locationId: query.locationId } : {}),
           location: { isActive: true, provider: { status: 'APPROVED' } },
           OR: [{ affiliationId: null }, { affiliation: { status: 'ACTIVE' } }],
@@ -91,6 +97,23 @@ export function discoveryRouter(): Router {
           currency: s.currency,
         }));
     },
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/suggest',
+    summary: 'Smart search: understands symptoms, everyday words, typos and local words; suggests specialists, doctors, places, tests and medicines',
+    description: 'Symptoms lead to specialists only through APPROVED clinical mappings; red-flag symptoms return emergency guidance. Tests and medicines are matched by their own names, never suggested for a symptom.',
+    tags,
+    auth: 'none',
+    query: z.object({
+      q: z.string().trim().min(2).max(120),
+      lat: z.coerce.number().min(-90).max(90).optional(),
+      lng: z.coerce.number().min(-180).max(180).optional(),
+      limit: z.coerce.number().int().min(1).max(20).default(6),
+    }),
+    response: z.any(),
+    handler: ({ query }) => smartSearch(query),
   });
 
   return r;

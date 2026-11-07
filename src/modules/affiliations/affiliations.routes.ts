@@ -106,7 +106,7 @@ export function affiliationsRouter(): Router {
     summary: 'Affiliations of this facility',
     tags: portalTags,
     params: z.object({ providerId: z.uuid() }),
-    query: PaginationQuery.extend({ status: StatusEnum.optional() }),
+    query: PaginationQuery.extend({ status: StatusEnum.optional(), departmentCode: z.string().max(64).optional(), specialityCode: z.string().max(64).optional(), engagementType: z.enum(['FULL_TIME', 'PART_TIME', 'VISITING', 'CONSULTANT']).optional(), q: z.string().trim().max(100).optional() }),
     response: AffiliationDto,
     handler: async ({ params, query, auth }) => {
       await assertProviderAccess(auth, params.providerId, { platformPermission: 'affiliations.read', capability: 'manage_affiliations' });
@@ -147,7 +147,7 @@ export function affiliationsRouter(): Router {
     path: '',
     summary: 'My affiliations',
     tags: doctorTags,
-    query: PaginationQuery.extend({ status: StatusEnum.optional() }),
+    query: PaginationQuery.extend({ status: StatusEnum.optional(), departmentCode: z.string().max(64).optional(), specialityCode: z.string().max(64).optional(), engagementType: z.enum(['FULL_TIME', 'PART_TIME', 'VISITING', 'CONSULTANT']).optional(), q: z.string().trim().max(100).optional() }),
     response: AffiliationDto,
     handler: async ({ query, auth }) => aff.listAffiliations({ ...query, doctorProviderId: await ownDoctor(auth) }),
   });

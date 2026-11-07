@@ -4,7 +4,8 @@ import { defineRoute, IdParams } from '../../http/route.js';
 import { PaginationQuery } from '../../lib/pagination.js';
 import { prisma } from '../../lib/prisma.js';
 import { badRequest, notFound } from '../../lib/errors.js';
-import { DateString, DateTimeString, MoneyInput, Phone } from '../../http/dto.js';
+import { BirthDate, DateString, DateTimeString, MoneyInput, Phone } from '../../http/dto.js';
+import { istToUtc } from '../../lib/time.js';
 import { audit } from '../../lib/audit.js';
 import { assertProviderAccess, getOwnDoctorProviderId } from '../providers/provider-access.js';
 import * as appts from './appointments.service.js';
@@ -248,15 +249,25 @@ export function appointmentsRouter(): Router {
     kind: 'list',
     method: 'get',
     path: '',
-    summary: 'Appointments at this provider',
+    summary: 'Appointments at this provider, filterable by doctor, department, status and patient name/phone/reference',
     tags: portalTags,
     params: z.object({ providerId: z.uuid() }),
-    query: PaginationQuery.extend({ status: StatusEnum.optional() }),
+    query: PaginationQuery.extend({
+      status: StatusEnum.optional(), doctorProviderId: z.uuid().optional(), departmentCode: z.string().max(64).optional(), q: z.string().trim().max(100).optional(),
+      startsFrom: DateTimeString.optional().describe('Visits starting at or after this time (Upcoming tab: now)'),
+      startsTo: DateTimeString.optional().describe('Visits starting before this time (Past tab: now)'),
+      date: DateString.optional().describe('Visits on this IST calendar day'),
+    }),
     response: AppointmentDto,
     handler: async ({ params, query, auth }) => {
       await assertProviderAccess(auth, params.providerId, { platformPermission: 'bookings.read', capability: 'manage_bookings' });
+      const { date, startsFrom, startsTo, ...rest } = query;
+      const window = date
+        ? { startsFrom: istToUtc(date, 0), startsTo: istToUtc(date, 24 * 60) }
+        : { startsFrom: startsFrom ? new Date(startsFrom) : undefined, startsTo: startsTo ? new Date(startsTo) : undefined };
       const p = await prisma.provider.findUniqueOrThrow({ where: { id: params.providerId }, select: { type: true } });
-      return appts.listAppointments({ ...query, ...(p.type === 'DOCTOR' ? { doctorProviderId: params.providerId } : { facilityProviderId: params.providerId }) });
+      // A doctor's own practice view is always scoped to them; a facility may narrow to one of its doctors.
+      return appts.listAppointments({ ...rest, ...window, ...(p.type === 'DOCTOR' ? { doctorProviderId: params.providerId } : { facilityProviderId: params.providerId }) });
     },
   });
 
@@ -329,7 +340,7 @@ export function appointmentsRouter(): Router {
     body: z.object({
       fullName: z.string().trim().min(2).max(160),
       relationship: z.enum(['SPOUSE', 'CHILD', 'PARENT', 'SIBLING', 'OTHER']),
-      dateOfBirth: DateString.optional(),
+      dateOfBirth: BirthDate.optional(),
       gender: z.enum(['FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED']).optional(),
     }),
     response: ProfileDto,
@@ -392,7 +403,9 @@ export function appointmentsRouter(): Router {
     response: AppointmentDto,
     handler: async ({ params, auth }) => {
       await assertOwnAppointment(auth, params.id);
-      return appts.getAppointment(params.id);
+      const [appointment, review] = await Promise.all([appts.getAppointment(params.id), prisma.review.findUnique({ where: { appointmentId: params.id }, select: { id: true } })]);
+      // Lets the app hide "Rate this visit" once the patient has reviewed it.
+      return { ...appointment, reviewed: !!review };
     },
   });
 

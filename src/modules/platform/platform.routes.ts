@@ -87,7 +87,7 @@ export function platformRouter(): Router {
     response: z.object({ key: z.string(), value: z.unknown(), version: z.number().int() }).passthrough(),
     handler: async ({ params, body, auth }) => {
       const updated = await prisma.$transaction(async (tx) => {
-        if (/^(smtp|branding)./.test(params.key)) throw badRequest('Use the Branding / Email configuration screens for this setting');
+        if (/^(smtp|branding|payments|push|patient)./.test(params.key)) throw badRequest('Use the dedicated configuration screen (Branding, Email, Payments, Push or Patient App) for this setting');
         const s = await tx.platformSetting.findUnique({ where: { key: params.key } });
         if (!s) throw notFound('Setting');
         if (typeof s.value !== typeof body.value) throw badRequest(`This setting expects a ${typeof s.value}`);
@@ -213,7 +213,7 @@ export function platformRouter(): Router {
       last24h: z.record(z.string(), z.number().int()),
       byChannel24h: z.record(z.string(), z.number().int()),
       oldestQueuedAt: z.string().nullable(),
-      drivers: z.record(z.string(), z.enum(['smtp', 'log'])),
+      drivers: z.record(z.string(), z.enum(['smtp', 'log', 'webpush', 'inapp'])),
       processing: z.enum(['inline', 'background']),
     }),
     handler: async () => {

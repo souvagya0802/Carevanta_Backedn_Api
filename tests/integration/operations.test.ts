@@ -198,11 +198,16 @@ describe('emergency dispatch', () => {
     const second = await p.post('/api/v1/patient/emergency', { district: 'Purba Medinipur' });
     expect(second.body.data.status).toBe('NO_PROVIDER_AVAILABLE');
 
+    // The accepted trip is recoverable after an app reload, until it completes.
+    const active = await dispatcher.get(`/api/v1/portal/providers/${opId}/dispatch/active`);
+    expect(active.body.data.map((d: { id: string }) => d.id)).toEqual([live.body.data.requestId]);
+
     for (const s of ['EN_ROUTE', 'ARRIVED', 'PATIENT_ONBOARD', 'AT_DESTINATION', 'COMPLETED']) {
       const r = await dispatcher.post(`/api/v1/portal/providers/${opId}/dispatch/requests/${live.body.data.requestId}/progress`, { status: s });
       expect(r.status, `${s}: ${JSON.stringify(r.body)}`).toBe(200);
     }
     expect((await prisma.ambulanceVehicle.findUniqueOrThrow({ where: { id: v.body.data.id } })).status).toBe('AVAILABLE');
+    expect((await dispatcher.get(`/api/v1/portal/providers/${opId}/dispatch/active`)).body.data).toHaveLength(0);
 
     // TEST drills never notify operators.
     const drill = await ops.post('/api/v1/admin/dispatch/test', { district: 'Purba Medinipur' });

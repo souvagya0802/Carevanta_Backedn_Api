@@ -47,7 +47,7 @@ describe('notification outbox', () => {
     expect(drain.body.data.remaining).toBe(0);
 
     // A notification whose template is missing fails; bulk retry re-queues it.
-    const orphan = await prisma.notification.create({ data: { channel: 'PUSH', templateKey: 'no.such_template', recipient: 'device-token', payload: {} } });
+    const orphan = await prisma.notification.create({ data: { channel: 'SMS', templateKey: 'no.such_template', recipient: '+919800000000', payload: {} } });
     await sa.post('/api/v1/admin/notifications/deliver-now');
     expect((await prisma.notification.findUniqueOrThrow({ where: { id: orphan.id } })).lastError).toContain('No active template');
     await prisma.notification.update({ where: { id: orphan.id }, data: { status: 'FAILED' } });

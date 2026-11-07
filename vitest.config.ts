@@ -23,7 +23,6 @@ export default defineConfig({
       LOGIN_MAX_FAILURES: '5',
       LOGIN_LOCKOUT_MINUTES: '15',
       RAZORPAY_WEBHOOK_SECRET: 'test-webhook-secret',
-      DB_POOL_MAX: '20',
       STORAGE_LOCAL_DIR: './.tmp/test-storage',
     },
   },

@@ -5,7 +5,7 @@
 | Phase | Content | State |
 |---|---|---|
 | 1 Discovery & design | requirements inventory, architecture, schema, API contract, security/threat model, test strategy, open questions | `docs/` |
-| 2 Foundation | Express 5 + TS strict, env validation, Pino, error handling, Prisma 7 + Neon, embedded-PG test infra, initial migrations | done |
+| 2 Foundation | Express 5 + TS strict, env validation, Pino, error handling, Prisma + Neon, embedded-PG test infra, initial migrations (superseded 2026-11-07 by the move to MongoDB Atlas, see docs/database.md) | done |
 | 3 Identity & administration | auth, RBAC, users, providers of all types, verification cases, documents, payout accounts | done |
 | 4 Healthcare operations | affiliations, catalogue + clinical review, discovery, scheduling, bookings, diagnostics, pharmacy, ambulance dispatch | done |
 | 5 Finance & reporting | commission policies, payments/webhooks, refunds, snapshots, ledger, settlements, reconciliation, analytics, exports | done |

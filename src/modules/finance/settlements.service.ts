@@ -1,4 +1,5 @@
-import { prisma, Prisma } from '../../lib/prisma.js';
+import type { Prisma } from '../../lib/prisma.js';
+import { prisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, notFound, preconditionFailed, separationOfDuties } from '../../lib/errors.js';
 import { makeReference, REF } from '../../lib/reference.js';
@@ -28,12 +29,20 @@ export async function createBatch(actor: AuthContext, input: { asOf?: Date; note
 
   return prisma.$transaction(
     async (tx) => {
-      const groups = await tx.$queryRaw<{ provider_id: string; total: bigint; ids: string[] }[]>`
-        SELECT provider_id, SUM(amount_minor)::bigint AS total, array_agg(id) AS ids
-          FROM provider_ledger_entries
-         WHERE settlement_item_id IS NULL AND created_at <= ${cutoff}
-         GROUP BY provider_id
-        HAVING SUM(amount_minor) > 0`;
+      // Unsettled entries up to the cut-off, grouped per provider; only positive balances are paid out.
+      const unsettled = await tx.providerLedgerEntry.findMany({
+        where: { settlementItemId: null, createdAt: { lte: cutoff } },
+        select: { id: true, providerId: true, amountMinor: true },
+        orderBy: { createdAt: 'asc' },
+      });
+      const byProvider = new Map<string, { provider_id: string; total: bigint; ids: string[] }>();
+      for (const e of unsettled) {
+        const g = byProvider.get(e.providerId) ?? { provider_id: e.providerId, total: 0n, ids: [] };
+        g.total += e.amountMinor;
+        g.ids.push(e.id);
+        byProvider.set(e.providerId, g);
+      }
+      const groups = [...byProvider.values()].filter((g) => g.total > 0n);
 
       const skipped: { providerId: string; reason: string; amountMinor: number }[] = [];
       const eligible: typeof groups = [];
@@ -67,7 +76,8 @@ export async function createBatch(actor: AuthContext, input: { asOf?: Date; note
       await audit(tx, { action: 'settlement.batch_created', entityType: 'settlement_batch', entityId: batch.id, metadata: { totalMinor: total.toString(), items: eligible.length, skipped: skipped.length } });
       return { batch: ready, skipped };
     },
-    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeout: 30_000 },
+    // Concurrent batch runs are serialised by the conditional updateMany above (write conflicts abort the loser).
+    { timeout: 30_000 },
   );
 }
 

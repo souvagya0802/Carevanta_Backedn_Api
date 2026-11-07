@@ -1,3 +1,4 @@
+import { notifyProviderStaff, notifyUsers } from '../notifications/events.js';
 import express, { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -31,6 +32,8 @@ const OrderDto = z.object({ id: z.uuid(), reference: z.string(), status: StatusE
 
 const include = {
   provider: { select: { id: true, displayName: true, type: true } },
+  // The centre to visit (null for home collection): address and coordinates for maps and directions.
+  location: { select: { id: true, name: true, addressLine1: true, city: true, district: true, pincode: true, latitude: true, longitude: true, phone: true } },
   patient: { select: { id: true, fullName: true } },
   items: true,
   reports: { orderBy: { version: 'asc' as const }, select: { id: true, version: true, status: true, publishedAt: true, correctionReason: true, supersedesId: true } },
@@ -43,6 +46,7 @@ function orderDto(o: Prisma.DiagnosticOrderGetPayload<{ include: typeof include 
     reference: o.reference,
     status: o.status,
     provider: o.provider,
+    location: o.location ?? null,
     patient: o.patient,
     collectionMode: o.collectionMode,
     collectionPincode: o.collectionPincode,
@@ -63,6 +67,25 @@ async function load(id: string) {
   const o = await prisma.diagnosticOrder.findUnique({ where: { id }, include });
   if (!o) throw notFound('Diagnostic order');
   return orderDto(o);
+}
+export const loadDiagnosticOrder = load;
+
+/** Cursor page of orders; `where` is scoped by the caller (admin: any; portal: one lab). */
+export async function listDiagnosticOrders(where: Prisma.DiagnosticOrderWhereInput, q: { limit: number; cursor?: string }) {
+  const rows = await prisma.diagnosticOrder.findMany({ where: { ...where, ...cursorWhere(q.cursor) }, include, orderBy: cursorOrderBy(), take: q.limit + 1 });
+  const { items, page } = buildPage(rows, q.limit, (o) => o.createdAt);
+  return { items: items.map(orderDto), page };
+}
+
+/** Lab staff set or move the collection / visit time for an order that is still open. */
+export async function scheduleDiagnosticOrder(providerId: string, orderId: string, scheduledAt: string, actorUserId: string) {
+  const o = await prisma.diagnosticOrder.findFirst({ where: { id: orderId, providerId } });
+  if (!o) throw notFound('Diagnostic order');
+  if (!['REQUESTED', 'CONFIRMED'].includes(o.status)) throw conflict('Only requested or confirmed orders can be rescheduled');
+  const when = new Date(scheduledAt);
+  if (when.getTime() < Date.now() - 60_000) throw badRequest('The time must be in the future');
+  await prisma.diagnosticOrder.update({ where: { id: orderId }, data: { scheduledAt: when, version: { increment: 1 } } });
+  await audit(prisma, { action: 'diagnostic_order.scheduled', entityType: 'diagnostic_order', entityId: orderId, actorUserId, metadata: { scheduledAt: when.toISOString() } });
 }
 
 export async function createDiagnosticOrder(input: {
@@ -116,6 +139,7 @@ export async function createDiagnosticOrder(input: {
     });
     await createTransaction(tx, { sourceType: 'DIAGNOSTIC_ORDER', sourceId: order.id, providerId: provider.id, patientProfileId: input.patientProfileId, grossMinor: total, attribution: input.attribution, payAtProvider: true });
     await audit(tx, { action: 'diagnostic_order.created', entityType: 'diagnostic_order', entityId: order.id, actorUserId: input.actorUserId, metadata: { tests: offerings.length, collectionMode: input.collectionMode } });
+    await notifyProviderStaff(tx, provider.id, 'manage_bookings', { key: 'portal.diagnostic_order_placed', title: 'New test order', body: `${order.reference} · ${offerings.length} test(s) · ${input.collectionMode === 'HOME_COLLECTION' ? 'home collection' : 'centre visit'}`, link: `/diagnostic-orders?id=${order.id}` });
     return order.id;
   });
 }
@@ -162,6 +186,8 @@ export async function publishReport(auth: AuthContext, orderId: string, file: Bu
       },
     });
     await audit(tx, { action: previous ? 'diagnostic_report.corrected' : 'diagnostic_report.published', entityType: 'diagnostic_order', entityId: orderId, metadata: { reportId: report.id, version: report.version } });
+    const o = await tx.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, patient: { select: { accountUserId: true } } } });
+    if (o) await notifyUsers(tx, [o.patient.accountUserId], { key: 'patient.report_published', title: previous ? 'Your report was corrected' : 'Your report is ready', body: `Order ${o.reference}`, link: `/orders/${orderId}` });
     return report;
   });
 }
@@ -180,16 +206,7 @@ export function diagnosticsRouter(): Router {
     permissions: ['diagnostics.read'],
     query: PaginationQuery.extend({ status: StatusEnum.optional(), providerId: z.uuid().optional() }),
     response: OrderDto,
-    handler: async ({ query }) => {
-      const rows = await prisma.diagnosticOrder.findMany({
-        where: { ...(query.status ? { status: query.status } : {}), ...(query.providerId ? { providerId: query.providerId } : {}), ...cursorWhere(query.cursor) },
-        include,
-        orderBy: cursorOrderBy(),
-        take: query.limit + 1,
-      });
-      const { items, page } = buildPage(rows, query.limit, (o) => o.createdAt);
-      return { items: items.map(orderDto), page };
-    },
+    handler: ({ query }) => listDiagnosticOrders({ ...(query.status ? { status: query.status } : {}), ...(query.providerId ? { providerId: query.providerId } : {}) }, query),
   });
 
   defineRoute(r, base, {

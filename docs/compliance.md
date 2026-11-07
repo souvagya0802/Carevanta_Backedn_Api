@@ -19,7 +19,7 @@ This is an engineering checklist to drive legal review — **not legal advice**.
 | C13 | **GST** | Platform fee, provider services | `taxRateBps` per policy; commission tax in snapshots; GSTIN validated by format only | **Open**: rate/classification, who invoices, GST verification API access |
 | C14 | **Consumer Protection (E-Commerce) Rules 2020** | Marketplace | Support cases with SLAs, provider verification transparency, refund workflow | **Open**: grievance officer designation, mandatory disclosures on listings |
 | C15 | **ABDM (ABHA, HPR, HFR, health records)** | Health records interoperability | Not integrated | **Open** (phase 4) |
-| C16 | **Data residency** | Hosting | Neon us-east-2 today | **Open**: move to an India-adjacent region before real patient data; payment data stays at the gateway (RBI localisation) |
+| C16 | **Data residency** | Hosting | Atlas cluster region (check in the Atlas project) today | **Open**: move to an India-adjacent region before real patient data; payment data stays at the gateway (RBI localisation) |
 | C17 | **Medical records retention** (e.g., 3-year OPD record retention norms; state rules) | Reports, prescriptions | Versioned reports retained; legal holds | **Open**: define retention schedule |
 | C18 | **Clinical content and advertising** (no diagnosis, no superlative claims) | Search, listings | Discovery returns "not a diagnosis" disclaimer; mappings need clinical reviewer approval; red-flag terms route to emergency guidance | Recommended |
 

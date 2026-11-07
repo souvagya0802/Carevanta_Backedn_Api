@@ -1,5 +1,7 @@
 # Performance: benchmark method, measurements and limitations
 
+> **Historical.** These measurements were taken on PostgreSQL 18 before the 2026-11-07 move to MongoDB Atlas. The PostgreSQL benchmark scripts (`bench-seed`, `bench-run`, `explain`) were removed with the migration; the harness must be rebuilt against MongoDB before new numbers are claimed. Nothing in this file should be quoted as a MongoDB result.
+
 **Summary.** On a developer laptop with a 3.6-million-row synthetic dataset, 10 of 11 HTTP scenarios met the agreed targets (p95 ≤ 250 ms, p99 ≤ 600 ms, error rate ≤ 0.1 %) at 25 concurrent connections, and all 14 critical queries use index paths except one that is correctly a sequential scan for this dataset. This is **not** a production capacity statement: the environment, dataset shape and single-instance setup are described below so the numbers can be interpreted, and the harness is reproducible so they can be re-measured on real infrastructure.
 
 ## Workload assumptions

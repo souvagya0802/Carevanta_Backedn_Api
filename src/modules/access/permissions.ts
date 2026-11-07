@@ -66,6 +66,8 @@ export const PERMISSIONS = {
   'finance.manual.record': 'Record offline payments, manual refunds, ledger adjustments and payment overrides (audited)',
 
   // Platform
+  'reviews.read': 'View patient reviews, including ones awaiting moderation',
+  'reviews.moderate': 'Publish, reject or hide patient reviews',
   'support.read': 'View complaints and support cases',
   'support.manage': 'Work complaints and support cases',
   'audit.read': 'Search the audit log',
@@ -204,6 +206,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDef[] = [
       'bookings.manage',
       'support.read',
       'support.manage',
+      'reviews.read',
+      'reviews.moderate',
       'finance.read',
       'finance.refunds.request',
     ],
@@ -225,10 +229,10 @@ export const SYSTEM_ROLES: readonly SystemRoleDef[] = [
 /** Provider-scoped authority derived from ProviderMember.memberRole. */
 export const PROVIDER_MEMBER_CAPABILITIES = {
   // Owners and admins hold every capability for their own organisation only.
-  OWNER: ['manage_profile', 'manage_staff', 'manage_affiliations', 'manage_schedules', 'manage_bookings', 'view_finance', 'review_prescriptions', 'publish_reports', 'manage_dispatch'],
-  ADMIN: ['manage_profile', 'manage_affiliations', 'manage_schedules', 'manage_bookings', 'view_finance', 'review_prescriptions', 'publish_reports', 'manage_dispatch'],
+  OWNER: ['manage_profile', 'manage_staff', 'manage_affiliations', 'manage_schedules', 'manage_bookings', 'manage_inventory', 'view_finance', 'review_prescriptions', 'publish_reports', 'manage_dispatch'],
+  ADMIN: ['manage_profile', 'manage_affiliations', 'manage_schedules', 'manage_bookings', 'manage_inventory', 'view_finance', 'review_prescriptions', 'publish_reports', 'manage_dispatch'],
   STAFF: ['manage_bookings'],
-  PHARMACIST: ['manage_bookings', 'review_prescriptions'],
+  PHARMACIST: ['manage_bookings', 'manage_inventory', 'review_prescriptions'],
   LAB_TECHNICIAN: ['manage_bookings', 'publish_reports'],
   DISPATCHER: ['manage_dispatch'],
 } as const;

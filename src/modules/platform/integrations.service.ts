@@ -34,11 +34,17 @@ export async function getBranding(db: Db = prisma): Promise<Branding> {
 }
 
 export async function setSetting(db: Db, key: string, value: unknown, description: string, isSensitive: boolean, updatedById: string) {
-  await db.platformSetting.upsert({
-    where: { key },
-    create: { key, value: value as object, description, isSensitive, updatedById },
-    update: { value: value as object, isSensitive, version: { increment: 1 }, updatedById },
-  });
+  // A null value means "clear this setting": the row is removed so getSetting() falls back to its default. (The MongoDB
+  // connector has no JSON-null value for a required Json column, and callers only pass null to remove logos/images.)
+  if (value === null) {
+    await db.platformSetting.deleteMany({ where: { key } });
+  } else {
+    await db.platformSetting.upsert({
+      where: { key },
+      create: { key, value: value as object, description, isSensitive, updatedById },
+      update: { value: value as object, isSensitive, version: { increment: 1 }, updatedById },
+    });
+  }
   brandingCache = null;
   smtpCache = null;
 }

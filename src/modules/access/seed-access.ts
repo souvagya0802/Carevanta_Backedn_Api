@@ -29,7 +29,8 @@ export async function syncAccessControl(db: PrismaClient): Promise<void> {
     const toAdd = [...wanted].filter((id) => !have.has(id));
     const toRemove = [...have].filter((id) => !wanted.has(id));
     if (toAdd.length) {
-      await db.rolePermission.createMany({ data: toAdd.map((permissionId) => ({ roleId: role.id, permissionId })), skipDuplicates: true });
+      // `toAdd` already excludes existing grants (MongoDB createMany has no skipDuplicates).
+      await db.rolePermission.createMany({ data: toAdd.map((permissionId) => ({ roleId: role.id, permissionId })) });
     }
     if (toRemove.length) {
       await db.rolePermission.deleteMany({ where: { roleId: role.id, permissionId: { in: toRemove } } });

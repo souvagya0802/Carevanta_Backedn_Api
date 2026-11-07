@@ -1,10 +1,10 @@
-import { prisma } from '../../lib/prisma.js';
+import { prisma, transactionWithRetry, lockTransaction } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { AppError, badRequest, conflict, notFound, separationOfDuties } from '../../lib/errors.js';
 import { sha256Hex } from '../../lib/crypto.js';
 import { makeReference, REF } from '../../lib/reference.js';
 import { logger } from '../../lib/logger.js';
-import { getGateway } from './gateway.js';
+import { getGateway, type LiveGateway } from './gateway.js';
 import { onRefundSucceeded } from './commission.service.js';
 import type { AuthContext } from '../../middleware/auth.js';
 
@@ -18,14 +18,14 @@ export async function createPaymentOrder(transactionId: string, idempotencyKey: 
   const paid = txn.payments.filter((p) => p.status === 'CAPTURED').reduce((s, p) => s + p.amountMinor, 0n);
   const due = txn.grossMinor - paid;
   if (due <= 0n) throw conflict('Nothing is due');
-  const order = await getGateway().createOrder({ amountMinor: due, currency: txn.currency, receipt: txn.reference });
+  const order = await (await getGateway()).createOrder({ amountMinor: due, currency: txn.currency, receipt: txn.reference });
   if (order.amountMinor !== due || order.currency !== txn.currency) {
     throw new AppError(502, 'SERVICE_UNAVAILABLE', 'Gateway returned an unexpected order amount');
   }
   return prisma.payment.create({
     data: {
       transactionId: txn.id,
-      gateway: order.simulated ? 'TEST_GATEWAY' : 'RAZORPAY',
+      gateway: order.gateway,
       gatewayOrderId: order.gatewayOrderId,
       amountMinor: due,
       currency: txn.currency,
@@ -49,16 +49,58 @@ interface RazorpayEvent {
   };
 }
 
+interface StripeEvent {
+  id: string;
+  type: string;
+  data?: {
+    object?: {
+      object?: string; id: string; amount?: number; amount_received?: number; currency?: string; status?: string;
+      payment_method_types?: string[]; last_payment_error?: { code?: string; message?: string };
+      payment_intent?: string | null; refunds?: { data?: { id: string; amount: number; status: string }[] };
+    };
+  };
+}
+
+/**
+ * Stripe events are mapped onto the same shape Razorpay sends, so one
+ * processing path handles both. A Stripe PaymentIntent id is our "order id";
+ * the browser confirms it with the client secret; success is confirmed here.
+ */
+function normaliseStripeEvent(e: StripeEvent): RazorpayEvent {
+  const o = e.data?.object;
+  if (!o) return { event: e.type };
+  const currency = (o.currency ?? 'inr').toUpperCase();
+  switch (e.type) {
+    case 'payment_intent.succeeded':
+      return { event: 'payment.captured', payload: { payment: { entity: { id: o.id, order_id: o.id, amount: o.amount_received ?? o.amount ?? 0, currency, status: 'captured', method: o.payment_method_types?.[0] } } } };
+    case 'payment_intent.payment_failed':
+      return { event: 'payment.failed', payload: { payment: { entity: { id: o.id, order_id: o.id, amount: o.amount ?? 0, currency, status: 'failed', error_code: o.last_payment_error?.code, error_description: o.last_payment_error?.message } } } };
+    case 'charge.refunded': {
+      const r = o.refunds?.data?.[0];
+      return r ? { event: 'refund.processed', payload: { refund: { entity: { id: r.id, payment_id: o.payment_intent ?? '', amount: r.amount, status: r.status } } } } : { event: e.type };
+    }
+    case 'refund.updated':
+    case 'refund.created':
+      if (o.status === 'succeeded') return { event: 'refund.processed', payload: { refund: { entity: { id: o.id, payment_id: o.payment_intent ?? '', amount: o.amount ?? 0, status: o.status } } } };
+      if (o.status === 'failed' || o.status === 'canceled') return { event: 'refund.failed', payload: { refund: { entity: { id: o.id, payment_id: o.payment_intent ?? '', amount: o.amount ?? 0, status: o.status } } } };
+      return { event: e.type };
+    default:
+      return { event: e.type };
+  }
+}
+
 /**
  * Process one verified webhook. Stored once per (gateway, eventId): a duplicate
  * delivery is acknowledged and ignored. Amount/currency mismatches are never
  * applied — they are recorded for reconciliation.
  */
-export async function processWebhook(gateway: 'RAZORPAY' | 'TEST_GATEWAY', eventId: string, rawBody: Buffer) {
+export async function processWebhook(gateway: LiveGateway, eventId: string, rawBody: Buffer) {
   let event: RazorpayEvent;
   try {
-    event = JSON.parse(rawBody.toString('utf8')) as RazorpayEvent;
-  } catch {
+    const parsed = JSON.parse(rawBody.toString('utf8')) as unknown;
+    event = gateway === 'STRIPE' ? normaliseStripeEvent(parsed as StripeEvent) : (parsed as RazorpayEvent);
+  } catch (err) {
+    if (err instanceof AppError) throw err;
     throw badRequest('Malformed webhook body');
   }
   const payloadSha256 = sha256Hex(rawBody);
@@ -87,17 +129,17 @@ export async function replayWebhookEvent(actor: AuthContext, storedId: string) {
   if (!stored) throw notFound('Webhook event');
   if (stored.processingStatus !== 'FAILED') throw conflict(`Only FAILED events can be replayed; this one is ${stored.processingStatus}`);
   if (stored.gateway === 'MANUAL') throw conflict('Manual payments have no webhook to replay');
-  const result = await applyStoredEvent(stored.gateway, stored.id, stored.eventId, stored.payload as unknown as RazorpayEvent);
+  const result = await applyStoredEvent(stored.gateway as LiveGateway, stored.id, stored.eventId, stored.payload as unknown as RazorpayEvent);
   await audit(prisma, { action: 'webhook.replayed', entityType: 'webhook_event', entityId: stored.id, actorUserId: actor.userId, metadata: { eventId: stored.eventId, result: result.status } });
   return result;
 }
 
-async function applyStoredEvent(gateway: 'RAZORPAY' | 'TEST_GATEWAY', storedId: string, eventId: string, event: RazorpayEvent) {
+async function applyStoredEvent(gateway: LiveGateway, storedId: string, eventId: string, event: RazorpayEvent) {
   const stored = { id: storedId };
   try {
-    const result = await prisma.$transaction(async (tx) => {
-      // Lock the event row so concurrent deliveries serialise.
-      await tx.$queryRaw`SELECT id FROM payment_webhook_events WHERE id = ${stored.id}::uuid FOR UPDATE`;
+    const result = await transactionWithRetry(async (tx) => {
+      // Write to the event document first so concurrent deliveries conflict and serialise (transactionWithRetry reruns the loser).
+      await tx.paymentWebhookEvent.update({ where: { id: stored.id }, data: { version: { increment: 1 } }, select: { id: true } });
       const fresh = await tx.paymentWebhookEvent.findUniqueOrThrow({ where: { id: stored.id } });
       if (fresh.processingStatus === 'PROCESSED' || fresh.processingStatus === 'IGNORED') return { duplicate: true, status: fresh.processingStatus };
 
@@ -179,10 +221,10 @@ async function applyStoredEvent(gateway: 'RAZORPAY' | 'TEST_GATEWAY', storedId: 
 // ─── Refunds (maker–checker) ───────────────────────────────────────────────
 
 export async function requestRefund(actor: AuthContext, input: { transactionId: string; amountMinor: bigint; reason: string; idempotencyKey: string }) {
-  return prisma.$transaction(async (tx) => {
+  return transactionWithRetry(async (tx) => {
     const existing = await tx.refund.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
     if (existing) return existing;
-    await tx.$queryRaw`SELECT id FROM service_transactions WHERE id = ${input.transactionId}::uuid FOR UPDATE`;
+    await lockTransaction(tx, input.transactionId);
     const txn = await tx.serviceTransaction.findUnique({ where: { id: input.transactionId }, include: { payments: true, refunds: true } });
     if (!txn) throw notFound('Transaction');
     const captured = txn.payments.filter((p) => p.status === 'CAPTURED' || p.status === 'PARTIALLY_REFUNDED');
@@ -235,7 +277,7 @@ export async function reviewRefund(actor: AuthContext, refundId: string, decisio
     return;
   }
   try {
-    const g = await getGateway().createRefund({ gatewayPaymentId: refund.payment.gatewayPaymentId, amountMinor: refund.amountMinor, receipt: refund.reference });
+    const g = await (await getGateway()).createRefund({ gatewayPaymentId: refund.payment.gatewayPaymentId, amountMinor: refund.amountMinor, receipt: refund.reference });
     await prisma.refund.update({ where: { id: refundId }, data: { status: 'PROCESSING', gatewayRefundId: g.gatewayRefundId } });
     await audit(prisma, { action: 'refund.approved', entityType: 'refund', entityId: refundId, metadata: { gatewayRefundId: g.gatewayRefundId } });
   } catch (err) {

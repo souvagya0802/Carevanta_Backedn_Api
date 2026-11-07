@@ -5,7 +5,7 @@ import { defineRoute, IdParams } from '../../http/route.js';
 import { PaginationQuery } from '../../lib/pagination.js';
 import { prisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
-import { badRequest, conflict, isPgError, notFound, separationOfDuties } from '../../lib/errors.js';
+import { badRequest, conflict, notFound, separationOfDuties } from '../../lib/errors.js';
 import { encryptField } from '../../lib/crypto.js';
 import { DateString, Pincode, Reason, SearchText, iso } from '../../http/dto.js';
 import { env } from '../../config/env.js';
@@ -18,6 +18,7 @@ import {
   UpdateProviderInput,
 } from './providers.schemas.js';
 import * as providers from './providers.service.js';
+import * as providerAdmin from './provider-admin.service.js';
 import * as verification from './verification.service.js';
 import * as registries from './registries.service.js';
 import { PROVIDER_TRANSITIONS, VERIFICATION_REQUIREMENTS } from './provider-state.js';
@@ -294,16 +295,7 @@ export function providersRouter(): Router {
         .max(200),
     }),
     response: z.array(z.object({ purpose: z.string(), district: z.string(), pincode: z.string().nullable() })),
-    handler: async ({ params, body, auth }) => {
-      return prisma.$transaction(async (tx) => {
-        if (!(await tx.provider.findUnique({ where: { id: params.id }, select: { id: true } }))) throw notFound('Provider');
-        await tx.providerServiceArea.deleteMany({ where: { providerId: params.id } });
-        const unique = new Map(body.areas.map((a) => [`${a.purpose}|${a.district}|${a.pincode ?? ''}`, a]));
-        await tx.providerServiceArea.createMany({ data: [...unique.values()].map((a) => ({ providerId: params.id, ...a, pincode: a.pincode ?? null })) });
-        await audit(tx, { action: 'provider.service_areas_updated', entityType: 'provider', entityId: params.id, actorUserId: auth.userId, metadata: { count: unique.size } });
-        return tx.providerServiceArea.findMany({ where: { providerId: params.id }, select: { purpose: true, district: true, pincode: true } });
-      });
-    },
+    handler: ({ params, body, auth }) => providerAdmin.setServiceAreas(auth, params.id, body.areas),
   });
 
   // ── Members ────────────────────────────────────────────────────────────
@@ -320,21 +312,7 @@ export function providersRouter(): Router {
     }),
     response: ProviderDetail,
     handler: async ({ params, body, auth }) => {
-      try {
-        await prisma.$transaction(async (tx) => {
-          const provider = await tx.provider.findUnique({ where: { id: params.id } });
-          if (!provider) throw notFound('Provider');
-          const user = await tx.user.findUnique({ where: { id: body.userId } });
-          if (!user || user.status === 'ANONYMISED' || user.status === 'DEACTIVATED') throw badRequest('User must be an active account');
-          await tx.providerMember.create({
-            data: { providerId: params.id, userId: body.userId, memberRole: body.memberRole, status: 'ACTIVE', invitedById: auth.userId, joinedAt: new Date() },
-          });
-          await audit(tx, { action: 'provider.member_added', entityType: 'provider', entityId: params.id, metadata: { userId: body.userId, memberRole: body.memberRole } });
-        });
-      } catch (err) {
-        if (isPgError(err, '23505')) throw conflict('This user is already a member of the provider');
-        throw err;
-      }
+      await providerAdmin.addMember(auth, params.id, body);
       return providers.getProvider(params.id);
     },
   });
@@ -348,17 +326,8 @@ export function providersRouter(): Router {
     permissions: ['providers.members.manage'],
     params: z.object({ id: z.uuid(), memberId: z.uuid() }),
     response: ProviderDetail,
-    handler: async ({ params }) => {
-      await prisma.$transaction(async (tx) => {
-        const m = await tx.providerMember.findFirst({ where: { id: params.memberId, providerId: params.id, status: { not: 'REMOVED' } } });
-        if (!m) throw notFound('Member');
-        if (m.memberRole === 'OWNER') {
-          const owners = await tx.providerMember.count({ where: { providerId: params.id, memberRole: 'OWNER', status: 'ACTIVE' } });
-          if (owners <= 1) throw conflict('Assign another owner before removing the last one');
-        }
-        await tx.providerMember.update({ where: { id: m.id }, data: { status: 'REMOVED', removedAt: new Date() } });
-        await audit(tx, { action: 'provider.member_removed', entityType: 'provider', entityId: params.id, metadata: { userId: m.userId } });
-      });
+    handler: async ({ params, auth }) => {
+      await providerAdmin.removeMember(auth, params.id, params.memberId);
       return providers.getProvider(params.id);
     },
   });
@@ -518,23 +487,7 @@ export function providersRouter(): Router {
     body: z.object({ departmentCodes: z.array(z.string().max(64)).max(60) }),
     response: ProviderDetail,
     handler: async ({ params, body, auth }) => {
-      await prisma.$transaction(async (tx) => {
-        const p = await tx.provider.findUnique({ where: { id: params.id } });
-        if (!p) throw notFound('Provider');
-        if (p.type !== 'HOSPITAL' && p.type !== 'CLINIC') throw badRequest('Departments apply to hospitals and clinics only');
-        const depts = await tx.department.findMany({ where: { code: { in: body.departmentCodes }, isActive: true } });
-        if (depts.length !== new Set(body.departmentCodes).size) throw badRequest('Unknown department code');
-        const keep = new Set(depts.map((d) => d.id));
-        await tx.facilityDepartment.updateMany({ where: { providerId: p.id, departmentId: { notIn: [...keep] } }, data: { isActive: false } });
-        for (const d of depts) {
-          await tx.facilityDepartment.upsert({
-            where: { providerId_departmentId: { providerId: p.id, departmentId: d.id } },
-            create: { providerId: p.id, departmentId: d.id },
-            update: { isActive: true },
-          });
-        }
-        await audit(tx, { action: 'provider.departments_updated', entityType: 'provider', entityId: p.id, actorUserId: auth.userId, metadata: { codes: body.departmentCodes } });
-      });
+      await providerAdmin.setDepartments(auth, params.id, body.departmentCodes);
       return providers.getProvider(params.id);
     },
   });
@@ -549,14 +502,7 @@ export function providersRouter(): Router {
     body: z.object({ amenityCodes: z.array(z.string().max(64)).max(60) }),
     response: ProviderDetail,
     handler: async ({ params, body, auth }) => {
-      await prisma.$transaction(async (tx) => {
-        if (!(await tx.provider.findUnique({ where: { id: params.id }, select: { id: true } }))) throw notFound('Provider');
-        const items = await tx.amenity.findMany({ where: { code: { in: body.amenityCodes } } });
-        if (items.length !== new Set(body.amenityCodes).size) throw badRequest('Unknown amenity code');
-        await tx.providerAmenity.deleteMany({ where: { providerId: params.id, amenityId: { notIn: items.map((i) => i.id) } } });
-        await tx.providerAmenity.createMany({ data: items.map((i) => ({ providerId: params.id, amenityId: i.id })), skipDuplicates: true });
-        await audit(tx, { action: 'provider.amenities_updated', entityType: 'provider', entityId: params.id, actorUserId: auth.userId, metadata: { codes: body.amenityCodes } });
-      });
+      await providerAdmin.setAmenities(auth, params.id, body.amenityCodes);
       return providers.getProvider(params.id);
     },
   });

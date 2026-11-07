@@ -5,6 +5,9 @@
  * UI should present it. Keys without metadata are still editable (type-checked
  * only), so adding a setting never requires a dashboard release.
  */
+import { validateMemberCapabilities, validatePortalUi } from '../portal/portal-ui.js';
+import { validatePatientUi } from '../patient/patient-ui.js';
+
 export type SettingType = 'integer' | 'number' | 'boolean' | 'string' | 'json';
 export type SettingRisk = 'low' | 'medium' | 'high';
 
@@ -27,6 +30,10 @@ export interface SettingMeta {
   help?: string;
   /** Code default used by `getSetting(key, fallback)`; the UI offers "reset to default". */
   default: unknown;
+  /** Extra validation for JSON settings: returns a readable problem or null. */
+  validate?: (value: unknown) => string | null;
+  /** Edited through a dedicated screen rather than the generic settings list. */
+  editor?: 'portal';
 }
 
 export const SETTING_GROUPS: Record<string, { label: string; description: string }> = {
@@ -35,6 +42,10 @@ export const SETTING_GROUPS: Record<string, { label: string; description: string
   emergency: { label: 'Emergency', description: 'Ambulance dispatch and the public emergency number.' },
   search: { label: 'Discovery', description: 'How patients find providers.' },
   platform: { label: 'Platform', description: 'General platform behaviour.' },
+  portal: { label: 'Provider Portal', description: 'What provider staff see: section names, page copy, banner, support contacts and role permissions.' },
+  payments: { label: 'Payments', description: 'Online payment gateways (Razorpay, Stripe). Edited under Settings → Payments.' },
+  push: { label: 'Push Notifications', description: 'Web Push (VAPID) keys. Edited under Settings → Push.' },
+  patient: { label: 'Patient App', description: 'Home hero, landing page, categories, banner, support and theme colours of the patient app. Edited under Settings → Patient App.' },
 };
 
 export const SETTING_META: Record<string, SettingMeta> = {
@@ -45,6 +56,9 @@ export const SETTING_META: Record<string, SettingMeta> = {
   'emergency.public_number': { label: 'Public emergency number', group: 'emergency', type: 'string', pattern: '^[0-9]{2,6}$', patternHint: '2–6 digits', risk: 'high', default: '112', help: 'Shown first on every emergency screen before any in-app dispatch. In India this is 112.' },
   'emergency.live_dispatch_enabled': { label: 'Live ambulance dispatch', group: 'emergency', type: 'boolean', risk: 'high', default: false, help: 'When on, emergency requests are sent to real partner operators. Enable only with signed operator agreements, a tested escalation rota and completed drills.' },
   'search.default_radius_km': { label: 'Default search radius', group: 'search', type: 'integer', unit: 'km', min: 1, max: 200, step: 1, risk: 'low', default: 15, help: 'Used when a patient searches without choosing a distance.' },
+  'portal.ui': { label: 'Portal structure and copy', group: 'portal', type: 'json', risk: 'medium', default: {}, editor: 'portal', validate: validatePortalUi, help: 'Section names, page titles and subtitles per provider type, hidden pages, organisation words, announcement banner and support contacts. Empty means "as shipped". Edit it under Settings → Provider Portal.' },
+  'patient.ui': { label: 'Patient app content', group: 'patient', type: 'json', risk: 'medium', default: {}, editor: 'portal', validate: validatePatientUi, help: 'Hero title/subtitle/buttons, landing page copy, category shortcuts, announcement, support contacts and theme colours. Empty means as shipped.' },
+  'portal.member_capabilities': { label: 'Provider staff permissions', group: 'portal', type: 'json', risk: 'high', default: {}, editor: 'portal', validate: validateMemberCapabilities, help: 'Which capabilities each provider staff role carries (admin, staff, pharmacist, lab technician, dispatcher). Owners always hold everything. Takes effect within 30 seconds for every provider.' },
 };
 
 const jsType = (v: unknown): SettingType => (typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? (Number.isInteger(v) ? 'integer' : 'number') : typeof v === 'string' ? 'string' : 'json');
@@ -73,8 +87,8 @@ export function validateSettingValue(key: string, current: unknown, value: unkno
       return null;
     }
     case 'json':
-      if (value === null || typeof value !== 'object') return 'This setting expects a JSON object';
-      return null;
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return 'This setting expects a JSON object';
+      return meta?.validate?.(value) ?? null;
   }
 }
 

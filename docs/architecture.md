@@ -2,13 +2,13 @@
 
 ## Shape
 
-A **modular monolith**: one Node.js process serves the HTTP API, a second process runs background jobs, both talk to one PostgreSQL database. Modules live under `src/modules/<domain>/` with `*.routes.ts` (HTTP contract) and `*.service.ts` (business rules); they share `src/lib` (database, errors, money, audit, pagination, crypto, state machines) and `src/middleware` (auth, idempotency, rate limit, errors).
+A **modular monolith**: one Node.js process serves the HTTP API, a second process runs background jobs, both talk to one MongoDB replica set. Modules live under `src/modules/<domain>/` with `*.routes.ts` (HTTP contract) and `*.service.ts` (business rules); they share `src/lib` (database, errors, money, audit, pagination, crypto, state machines) and `src/middleware` (auth, idempotency, rate limit, errors).
 
 ```
 clients ──HTTPS──▶ API (Express 5, stateless, N instances)
-                     │  pooled connection (Neon pooler)
+                     │  MongoDB driver (replica set, transactions)
                      ▼
-                PostgreSQL 18 (Neon)  ◀── direct connection ── Worker (pg-boss)
+                MongoDB 8 (Atlas)     ◀── same URI ─────────── Worker (cron + job leases)
                      ▲                                          notifications, exports,
                 private object storage (documents, reports)    credential expiry, cleanup
 ```
@@ -22,12 +22,12 @@ Why not microservices: one small team, one database, and every business transact
 | Node 22 LTS, TypeScript strict, ESM | Brief requirement; Prisma 7 is ESM-only |
 | Express 5 + `defineRoute` | Lightweight; one definition drives validation, auth, idempotency, response envelope and OpenAPI so docs cannot drift |
 | Zod 4 | Runtime validation for env, params, query, body; OpenAPI via `@asteasolutions/zod-to-openapi` |
-| Prisma 7 + `@prisma/adapter-pg` | Typed queries and migrations; raw SQL where Prisma cannot express it (CHECK/EXCLUDE constraints, triggers, conditional updates, geo) |
-| PostgreSQL 18 | UUIDv7 primary keys (`uuidv7()`), partial indexes, EXCLUDE constraints with `btree_gist`, `pg_trgm` search, `citext` emails |
-| pg-boss | Durable jobs in the same database — no Redis/queue infrastructure |
+| Prisma 6 (MongoDB connector) | Typed queries and interactive transactions; aggregation pipelines where Prisma cannot express a query (analytics, discovery ranking, grouped sums) — see `src/lib/mongo.ts` |
+| MongoDB 8 (Atlas replica set) | Multi-document transactions, partial unique indexes for one-live-row invariants (`src/lib/mongo-indexes.ts`), compare-and-set for capacity and stock |
+| croner + `job_leases` collection | Scheduled jobs with a per-job lease in the same database — no Redis or queue infrastructure |
 | Argon2id, `jose` HS256 | Password hashing and access tokens |
 | Pino | Structured JSON logs with redaction |
-| Vitest + Supertest + embedded-postgres | Real database in every test run; migrations exercised on each run |
+| Vitest + Supertest + mongodb-memory-server | Real replica set in every test run; schema push and index creation exercised each run |
 
 ## Request lifecycle
 
@@ -64,12 +64,12 @@ Why not microservices: one small team, one database, and every business transact
 
 ## Scalability posture
 
-Stateless API instances behind a load balancer; `DB_POOL_MAX × instances` must stay under the Neon pooler limit. Vertical PostgreSQL headroom covers the pilot and the first expansion. Known next steps, triggered by measurement rather than guesses: shared rate-limit store (Redis) once there are ≥ 2 instances, PostGIS for multi-district radius search, `audit_events` partitioning by month once it passes ~50 M rows, read replica for analytics. See `docs/performance.md` for measured numbers and `docs/database.md` for index rationale.
+Stateless API instances behind a load balancer; driver pools per instance must stay under the Atlas connection limit for the tier. Vertical Atlas tier headroom covers the pilot and the first expansion. Known next steps, triggered by measurement rather than guesses: shared rate-limit store (Redis) once there are ≥ 2 instances, PostGIS for multi-district radius search, `audit_events` partitioning by month once it passes ~50 M rows, read replica for analytics. See `docs/performance.md` for measured numbers and `docs/database.md` for index rationale.
 
 ## Repository layout
 
 ```
-prisma/schema/*.prisma   domain-split schema      prisma/migrations/   versioned SQL
+prisma/schema/*.prisma   domain-split schema      src/lib/mongo-indexes.ts   partial/geo indexes
 src/config/env.ts        validated environment    src/lib/             shared infrastructure
 src/http/                route layer + OpenAPI     src/middleware/      auth, idempotency, limits, errors
 src/modules/<domain>/    routes + services         src/jobs/            scheduled maintenance

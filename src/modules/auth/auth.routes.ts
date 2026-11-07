@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute } from '../../http/route.js';
-import { authLimiter } from '../../middleware/rate-limit.js';
+import { authLimiter, refreshLimiter } from '../../middleware/rate-limit.js';
 import { prisma } from '../../lib/prisma.js';
 import { PasswordSchema } from './passwords.js';
 import * as auth from './auth.service.js';
@@ -61,7 +61,7 @@ export function authRouter(): Router {
     tags,
     auth: 'none',
     status: 200,
-    middleware: [authLimiter],
+    middleware: [refreshLimiter],
     body: z.object({ refreshToken: z.string().min(20).max(200) }),
     response: TokenPair,
     handler: ({ body, req }) => auth.refresh(body.refreshToken, client(req)),

@@ -4,6 +4,7 @@ import { decryptField, encryptField } from '../../lib/crypto.js';
 import { logger } from '../../lib/logger.js';
 import type { NotificationChannel } from '../../../generated/prisma/client.js';
 import { getSmtpConfig, sendEmail } from '../platform/integrations.service.js';
+import { getPushConfig, sendPushToUser } from './push.service.js';
 import { env } from '../../config/env.js';
 
 export interface NotificationInput {
@@ -76,9 +77,9 @@ export const NOTIFICATION_CATALOGUE: readonly NotificationKeyInfo[] = [
 export const notificationKeyInfo = (key: string) => NOTIFICATION_CATALOGUE.find((k) => k.key === key);
 
 /** How each channel is actually delivered right now. Anything on the log driver is recorded, not sent. */
-export async function channelDrivers(): Promise<Record<NotificationChannel, 'smtp' | 'log'>> {
-  const smtp = await getSmtpConfig();
-  return { EMAIL: smtp ? 'smtp' : 'log', SMS: 'log', PUSH: 'log', IN_APP: 'log' };
+export async function channelDrivers(): Promise<Record<NotificationChannel, 'smtp' | 'log' | 'webpush' | 'inapp'>> {
+  const [smtp, push] = await Promise.all([getSmtpConfig(), getPushConfig()]);
+  return { EMAIL: smtp ? 'smtp' : 'log', SMS: 'log', PUSH: push ? 'webpush' : 'log', IN_APP: 'inapp' };
 }
 
 /**
@@ -103,12 +104,19 @@ export function smsSegments(text: string): { encoding: 'GSM-7' | 'UCS-2'; length
  * without printing the secret contents. Wire an Indian DLT-registered SMS
  * gateway here for SMS.
  */
-async function send(n: { channel: NotificationChannel; recipient: string; subject?: string | null; body: string }) {
+async function send(n: { channel: NotificationChannel; recipient: string; subject?: string | null; body: string; link?: string | null; urgent?: boolean }) {
   if (n.channel === 'EMAIL' && (await getSmtpConfig())) {
     const { messageId } = await sendEmail(n.recipient, n.subject ?? 'Carevanta', n.body);
     logger.info({ channel: n.channel, to: maskRecipient(n.recipient), messageId }, 'email sent via SMTP');
     return;
   }
+  if (n.channel === 'PUSH' && (await getPushConfig())) {
+    // For push the recipient is the user id; every subscribed device of theirs gets it.
+    const accepted = await sendPushToUser(n.recipient, { title: n.subject ?? 'Carevanta', body: n.body, link: n.link, urgent: n.urgent });
+    logger.info({ channel: n.channel, userId: n.recipient, accepted }, 'push sent');
+    return;
+  }
+  if (n.channel === 'IN_APP') return; // stored rows are the delivery
   logger.info({ channel: n.channel, to: maskRecipient(n.recipient), bytes: n.body.length }, 'notification dispatched (log driver)');
 }
 
@@ -126,33 +134,42 @@ export function deliverSoon(): void {
   });
 }
 
-/** Process a batch of queued notifications. Safe to run concurrently (SKIP LOCKED). */
+/**
+ * Process a batch of queued notifications. Safe to run concurrently: each row is
+ * claimed with an atomic findAndModify (status QUEUED, attempts < 5 → attempts+1),
+ * so two workers never pick the same notification.
+ */
 export async function deliverQueuedNotifications(batchSize = 50): Promise<number> {
-  const claimed = await prisma.$queryRaw<{ id: string }[]>`
-    UPDATE notifications SET attempts = attempts + 1
-    WHERE id IN (
-      SELECT id FROM notifications
-      WHERE status = 'QUEUED' AND attempts < 5
-      ORDER BY created_at
-      LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED
-    )
-    RETURNING id`;
+  const claimed: string[] = [];
+  for (let i = 0; i < batchSize; i++) {
+    const res = (await prisma.$runCommandRaw({
+      findAndModify: 'notifications',
+      query: { status: 'QUEUED', attempts: { $lt: 5 } },
+      sort: { created_at: 1 },
+      update: { $inc: { attempts: 1 } },
+      new: true,
+      fields: { _id: 1 },
+    })) as { value?: { _id: string } | null };
+    if (!res.value) break;
+    claimed.push(res.value._id);
+  }
   let sent = 0;
-  for (const { id } of claimed) {
+  for (const id of claimed) {
     const n = await prisma.notification.findUniqueOrThrow({ where: { id } });
     try {
-      const template = await prisma.notificationTemplate.findFirst({
-        where: { key: n.templateKey, channel: n.channel, isActive: true },
-        orderBy: { version: 'desc' },
-      });
-      if (!template) throw new Error(`No active template ${n.templateKey}/${n.channel}`);
+      // Email and SMS are rendered from templates; push and in-app rows already carry their text.
+      const templated = n.channel === 'EMAIL' || n.channel === 'SMS';
+      const template = templated ? await prisma.notificationTemplate.findFirst({ where: { key: n.templateKey, channel: n.channel, isActive: true }, orderBy: { version: 'desc' } }) : null;
+      if (templated && !template) throw new Error(`No active template ${n.templateKey}/${n.channel}`);
       const vars = decryptNotificationPayload(n.payload);
+      const raw = (n.payload as { urgent?: unknown } | null)?.urgent === true;
       await send({
         channel: n.channel,
         recipient: n.recipient,
-        subject: template.subject ? render(template.subject, vars) : null,
-        body: render(template.body, vars),
+        subject: template ? (template.subject ? render(template.subject, vars) : null) : n.title,
+        body: template ? render(template.body, vars) : (n.body ?? ''),
+        link: n.link,
+        urgent: raw,
       });
       // Once delivered, the secret payload is no longer needed — drop it.
       await prisma.notification.update({ where: { id }, data: { status: 'SENT', sentAt: new Date(), payload: {} } });

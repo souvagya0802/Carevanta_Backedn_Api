@@ -131,11 +131,13 @@ describe('refresh token rotation', () => {
     expect(ok.status).toBe(200);
   });
 
-  it('detects reuse of a rotated token and revokes the whole family', async () => {
+  it('detects reuse of a rotated token after the grace window and revokes the whole family', async () => {
     const user = await createUser();
     const t = await login(user.email!);
     const r1 = await api().post('/api/v1/auth/refresh').send({ refreshToken: t.refreshToken });
     expect(r1.status).toBe(200);
+    // Pretend the rotation happened a minute ago, outside the 30-second grace window.
+    await prisma.session.updateMany({ where: { userId: user.id, rotatedAt: { not: null } }, data: { rotatedAt: new Date(Date.now() - 60_000) } });
     const reuse = await api().post('/api/v1/auth/refresh').send({ refreshToken: t.refreshToken });
     expect(reuse.status).toBe(401);
     // The legitimately rotated token is now revoked too.
@@ -145,7 +147,26 @@ describe('refresh token rotation', () => {
     expect(events).toBe(1);
   });
 
-  it('only one of two concurrent refreshes succeeds', async () => {
+  it('accepts the previous token for a few seconds so two tabs or a reload do not log the patient out', async () => {
+    const user = await createUser();
+    const t = await login(user.email!);
+    const tabA = await api().post('/api/v1/auth/refresh').send({ refreshToken: t.refreshToken });
+    const tabB = await api().post('/api/v1/auth/refresh').send({ refreshToken: t.refreshToken });
+    expect(tabA.status).toBe(200);
+    expect(tabB.status).toBe(200);
+    expect(tabB.body.data.refreshToken).not.toBe(tabA.body.data.refreshToken);
+    // Both tabs keep working; nothing was flagged as theft.
+    expect((await api().post('/api/v1/auth/refresh').send({ refreshToken: tabA.body.data.refreshToken })).status).toBe(200);
+    expect((await api().post('/api/v1/auth/refresh').send({ refreshToken: tabB.body.data.refreshToken })).status).toBe(200);
+    expect(await prisma.auditEvent.count({ where: { action: 'auth.refresh_token_reuse_detected', entityId: user.id } })).toBe(0);
+    // A logged-out session gets no grace.
+    const fresh = await login(user.email!);
+    const rotated = await api().post('/api/v1/auth/refresh').send({ refreshToken: fresh.refreshToken });
+    await api().post('/api/v1/auth/logout').set('Authorization', `Bearer ${rotated.body.data.accessToken}`).send({ allDevices: true });
+    expect((await api().post('/api/v1/auth/refresh').send({ refreshToken: fresh.refreshToken })).status).toBe(401);
+  });
+
+  it('two concurrent refreshes of one token both stay in the same family', async () => {
     const user = await createUser();
     const t = await login(user.email!);
     const results = await Promise.all([
@@ -153,7 +174,9 @@ describe('refresh token rotation', () => {
       api().post('/api/v1/auth/refresh').send({ refreshToken: t.refreshToken }),
     ]);
     const statuses = results.map((r) => r.status).sort();
-    expect(statuses.filter((s) => s === 200).length).toBeLessThanOrEqual(1);
+    expect(statuses).toEqual([200, 200]);
+    const families = await prisma.session.findMany({ where: { userId: user.id }, select: { familyId: true } });
+    expect(new Set(families.map((f) => f.familyId)).size).toBe(1);
   });
 });
 

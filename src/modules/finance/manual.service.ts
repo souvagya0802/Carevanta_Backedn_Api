@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { prisma } from '../../lib/prisma.js';
+import { prisma, transactionWithRetry, lockTransaction } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, isPgError, notFound, separationOfDuties } from '../../lib/errors.js';
 import { onRefundSucceeded, post } from './commission.service.js';
@@ -36,8 +36,8 @@ export async function recordManualPayment(
   input: { receivedBy: 'PLATFORM' | 'PROVIDER'; amountMinor: bigint; method: ManualMethod; reference?: string; receivedAt: Date; note: string },
 ) {
   if (input.receivedAt.getTime() > Date.now() + 5 * 60_000) throw badRequest('receivedAt cannot be in the future');
-  return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT id FROM service_transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
+  return transactionWithRetry(async (tx) => {
+    await lockTransaction(tx, transactionId);
     const txn = await tx.serviceTransaction.findUnique({ where: { id: transactionId }, include: { payments: true } });
     if (!txn) throw notFound('Transaction');
     if (!['PENDING_PAYMENT', 'PAY_AT_PROVIDER'].includes(txn.status)) throw conflict(`Transaction is ${txn.status}; nothing left to record`, { status: txn.status });
@@ -110,7 +110,7 @@ export async function markPaymentAbandoned(actor: AuthContext, paymentId: string
  */
 export async function recordManualRefund(actor: AuthContext, refundId: string, input: { method: ManualMethod; reference?: string; processedAt: Date; note: string }) {
   if (input.processedAt.getTime() > Date.now() + 5 * 60_000) throw badRequest('processedAt cannot be in the future');
-  return prisma.$transaction(async (tx) => {
+  return transactionWithRetry(async (tx) => {
     const refund = await tx.refund.findUnique({ where: { id: refundId } });
     if (!refund) throw notFound('Refund');
     if (!['REQUESTED', 'APPROVED', 'FAILED'].includes(refund.status)) throw conflict(`Refund is ${refund.status}; only requested, approved or failed refunds can be recorded manually`);
@@ -143,7 +143,7 @@ export async function postAdjustment(actor: AuthContext, providerId: string, inp
     if (!txn || txn.providerId !== providerId) throw badRequest('The transaction does not belong to this provider', { field: 'transactionId' });
   }
   const id = randomUUID();
-  await prisma.$transaction(async (tx) => {
+  await transactionWithRetry(async (tx) => {
     await post(tx, { providerId, transactionId: input.transactionId ?? null, entryType: 'ADJUSTMENT', amountMinor: input.amountMinor, dedupeKey: `adjustment:${id}`, description: input.reason.slice(0, 300), actorUserId: actor.userId });
     await audit(tx, { action: 'ledger.adjustment_posted', entityType: 'provider', entityId: providerId, actorUserId: actor.userId, metadata: { amountMinor: input.amountMinor.toString(), reason: input.reason, transactionId: input.transactionId ?? null, dedupeKey: `adjustment:${id}` } });
   });

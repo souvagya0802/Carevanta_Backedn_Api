@@ -41,16 +41,18 @@ enum MedicineSchedule {
 }
 
 model Speciality {
-  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  code        String   @unique @db.VarChar(64)
-  name        String   @unique @db.VarChar(120)
-  parentId    String?  @map("parent_id") @db.Uuid
-  description String?  @db.VarChar(1000)
+  id          String   @id @map("_id") @default(uuid(7))
+  code        String   @unique
+  name        String   @unique
+  parentId    String?  @map("parent_id")
+  description String?
+  /// Everyday words patients use for this speciality ("child doctor", "skin specialist", "shishu"). Used by search only.
+  synonyms    String[] @default([])
   isActive    Boolean  @default(true) @map("is_active")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
-  parent      Speciality?                  @relation("SpecialityTree", fields: [parentId], references: [id], onDelete: Restrict)
+  parent      Speciality?                  @relation("SpecialityTree", fields: [parentId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   children    Speciality[]                 @relation("SpecialityTree")
   doctors     DoctorSpeciality[]
   conditions  ConditionSpecialityMapping[]
@@ -63,39 +65,38 @@ model Speciality {
 
 /// Searchable patient-facing term (disease, condition or symptom).
 model Condition {
-  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  name        String   @unique @db.VarChar(160)
-  slug        String   @unique @db.VarChar(180)
-  kind        String   @default("CONDITION") @db.VarChar(16) // CONDITION | SYMPTOM
-  synonyms    String[] @default([]) @db.VarChar(120)
+  id          String   @id @map("_id") @default(uuid(7))
+  name        String   @unique
+  slug        String   @unique
+  kind        String   @default("CONDITION") // CONDITION | SYMPTOM
+  synonyms    String[] @default([])
   isRedFlag   Boolean  @default(false) @map("is_red_flag") // e.g. chest pain → show emergency guidance first
   isActive    Boolean  @default(true) @map("is_active")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
   specialities ConditionSpecialityMapping[]
 
-  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "conditions_name_trgm_idx")
-  @@index([synonyms], type: Gin)
+  @@index([synonyms])
   @@map("conditions")
 }
 
 model ConditionSpecialityMapping {
-  id           String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  conditionId  String              @map("condition_id") @db.Uuid
-  specialityId String              @map("speciality_id") @db.Uuid
+  id           String              @id @map("_id") @default(uuid(7))
+  conditionId  String              @map("condition_id")
+  specialityId String              @map("speciality_id")
   relevance    MappingRelevance    @default(PRIMARY)
   reviewStatus MappingReviewStatus @default(DRAFT) @map("review_status")
-  rationale    String?             @db.VarChar(1000)
-  proposedById String?             @map("proposed_by_id") @db.Uuid
-  reviewedById String?             @map("reviewed_by_id") @db.Uuid
-  reviewedAt   DateTime?           @map("reviewed_at") @db.Timestamptz(3)
-  reviewNote   String?             @map("review_note") @db.VarChar(1000)
-  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  rationale    String?
+  proposedById String?             @map("proposed_by_id")
+  reviewedById String?             @map("reviewed_by_id")
+  reviewedAt   DateTime?           @map("reviewed_at")
+  reviewNote   String?             @map("review_note")
+  createdAt    DateTime            @default(now()) @map("created_at")
+  updatedAt    DateTime            @updatedAt @map("updated_at")
 
-  condition  Condition  @relation(fields: [conditionId], references: [id], onDelete: Cascade)
-  speciality Speciality @relation(fields: [specialityId], references: [id], onDelete: Restrict)
+  condition  Condition  @relation(fields: [conditionId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  speciality Speciality @relation(fields: [specialityId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@unique([conditionId, specialityId])
   @@index([specialityId])
@@ -104,14 +105,14 @@ model ConditionSpecialityMapping {
 }
 
 model Department {
-  id           String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  code         String   @unique @db.VarChar(64)
-  name         String   @unique @db.VarChar(120)
-  specialityId String?  @map("speciality_id") @db.Uuid
+  id           String   @id @map("_id") @default(uuid(7))
+  code         String   @unique
+  name         String   @unique
+  specialityId String?  @map("speciality_id")
   isActive     Boolean  @default(true) @map("is_active")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @map("created_at")
 
-  speciality Speciality?          @relation(fields: [specialityId], references: [id], onDelete: SetNull)
+  speciality Speciality?          @relation(fields: [specialityId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   facilities FacilityDepartment[]
   affiliations DoctorAffiliation[]
 
@@ -121,16 +122,16 @@ model Department {
 /// A department offered by a hospital/clinic. Creating it does not make it a
 /// verified claim; `verifiedAt` is set by the verification team.
 model FacilityDepartment {
-  id           String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  providerId   String    @map("provider_id") @db.Uuid
-  departmentId String    @map("department_id") @db.Uuid
+  id           String    @id @map("_id") @default(uuid(7))
+  providerId   String    @map("provider_id")
+  departmentId String    @map("department_id")
   isActive     Boolean   @default(true) @map("is_active")
-  verifiedAt   DateTime? @map("verified_at") @db.Timestamptz(3)
-  verifiedById String?   @map("verified_by_id") @db.Uuid
-  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  verifiedAt   DateTime? @map("verified_at")
+  verifiedById String?   @map("verified_by_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
 
-  provider   Provider   @relation(fields: [providerId], references: [id], onDelete: Cascade)
-  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  provider   Provider   @relation(fields: [providerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@unique([providerId, departmentId])
   @@index([departmentId, isActive])
@@ -139,11 +140,11 @@ model FacilityDepartment {
 
 /// Facility capability such as ICU, blood bank, CT scanner, wheelchair access.
 model Amenity {
-  id        String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  code      String   @unique @db.VarChar(64)
-  name      String   @db.VarChar(120)
-  category  String   @db.VarChar(48)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  id        String   @id @map("_id") @default(uuid(7))
+  code      String   @unique
+  name      String
+  category  String
+  createdAt DateTime @default(now()) @map("created_at")
 
   providers ProviderAmenity[]
 
@@ -151,103 +152,107 @@ model Amenity {
 }
 
 model ProviderAmenity {
-  providerId   String    @map("provider_id") @db.Uuid
-  amenityId    String    @map("amenity_id") @db.Uuid
-  verifiedAt   DateTime? @map("verified_at") @db.Timestamptz(3)
-  verifiedById String?   @map("verified_by_id") @db.Uuid
-  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  id String @id @default(uuid(7)) @map("_id")
+  providerId   String    @map("provider_id")
+  amenityId    String    @map("amenity_id")
+  verifiedAt   DateTime? @map("verified_at")
+  verifiedById String?   @map("verified_by_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
 
-  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
-  amenity  Amenity  @relation(fields: [amenityId], references: [id], onDelete: Restrict)
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  amenity  Amenity  @relation(fields: [amenityId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
-  @@id([providerId, amenityId])
+  @@unique([providerId, amenityId])
   @@index([amenityId])
   @@map("provider_amenities")
 }
 
 model Service {
-  id                     String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  code                   String          @unique @db.VarChar(64)
-  name                   String          @db.VarChar(200)
+  id                     String          @id @map("_id") @default(uuid(7))
+  code                   String          @unique
+  name                   String
   category               ServiceCategory
-  specialityId           String?         @map("speciality_id") @db.Uuid
-  description            String?         @db.VarChar(2000)
+  specialityId           String?         @map("speciality_id")
+  description            String?
   requiresPrescription   Boolean         @default(false) @map("requires_prescription")
   // Diagnostic-specific attributes (null for other categories)
-  sampleType             String?         @map("sample_type") @db.VarChar(64)
+  sampleType             String?         @map("sample_type")
   fastingRequired        Boolean?        @map("fasting_required")
-  preparationInstructions String?        @map("preparation_instructions") @db.VarChar(2000)
+  preparationInstructions String?        @map("preparation_instructions")
   isPanel                Boolean         @default(false) @map("is_panel")
+  /// Everyday words patients use for this test ("sugar test", "blood test"). Used by search only.
+  synonyms               String[]        @default([])
   isActive               Boolean         @default(true) @map("is_active")
-  createdAt              DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt              DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt              DateTime        @default(now()) @map("created_at")
+  updatedAt              DateTime        @updatedAt @map("updated_at")
 
-  speciality       Speciality?        @relation(fields: [specialityId], references: [id], onDelete: SetNull)
+  speciality       Speciality?        @relation(fields: [specialityId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   panelComponents  ServicePanelItem[] @relation("Panel")
   partOfPanels     ServicePanelItem[] @relation("Component")
   offerings        ProviderService[]
 
   @@index([category, isActive])
-  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "services_name_trgm_idx")
+  @@index([name], map: "services_name_trgm_idx")
   @@map("services")
 }
 
 model ServicePanelItem {
-  panelId     String @map("panel_id") @db.Uuid
-  componentId String @map("component_id") @db.Uuid
+  id String @id @default(uuid(7)) @map("_id")
+  panelId     String @map("panel_id")
+  componentId String @map("component_id")
 
-  panel     Service @relation("Panel", fields: [panelId], references: [id], onDelete: Cascade)
-  component Service @relation("Component", fields: [componentId], references: [id], onDelete: Restrict)
+  panel     Service @relation("Panel", fields: [panelId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  component Service @relation("Component", fields: [componentId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
-  @@id([panelId, componentId])
+  @@unique([panelId, componentId])
   @@map("service_panel_items")
 }
 
 /// A provider's priced offering of a catalogue service at a location.
 model ProviderService {
-  id                   String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  providerId           String   @map("provider_id") @db.Uuid
-  serviceId            String   @map("service_id") @db.Uuid
-  locationId           String?  @map("location_id") @db.Uuid
+  id                   String   @id @map("_id") @default(uuid(7))
+  providerId           String   @map("provider_id")
+  serviceId            String   @map("service_id")
+  locationId           String?  @map("location_id")
   priceMinor           BigInt   @map("price_minor")
-  currency             String   @default("INR") @db.Char(3)
+  currency             String   @default("INR")
   homeServiceAvailable Boolean  @default(false) @map("home_service_available")
   turnaroundHours      Int?     @map("turnaround_hours")
   isActive             Boolean  @default(true) @map("is_active")
-  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
 
-  provider Provider            @relation(fields: [providerId], references: [id], onDelete: Cascade)
-  service  Service             @relation(fields: [serviceId], references: [id], onDelete: Restrict)
-  location ProviderLocation?   @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  provider Provider            @relation(fields: [providerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  service  Service             @relation(fields: [serviceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location ProviderLocation?   @relation(fields: [locationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   orderItems DiagnosticOrderItem[]
 
   @@unique([providerId, serviceId, locationId])
   // NULL location means "all locations"; plain UNIQUE treats NULLs as distinct.
-  @@unique([providerId, serviceId], where: raw("location_id IS NULL"), map: "provider_services_providerwide_unique")
+  @@index([providerId, serviceId]) // runtime partial index: provider_services_providerwide_unique
   @@index([serviceId, isActive])
   @@map("provider_services")
 }
 
 model Medicine {
-  id                   String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  name                 String           @db.VarChar(200)
-  genericName          String?          @map("generic_name") @db.VarChar(200)
-  strength             String?          @db.VarChar(64)
-  dosageForm           String?          @map("dosage_form") @db.VarChar(64)
-  packSize             String?          @map("pack_size") @db.VarChar(64)
-  manufacturer         String?          @db.VarChar(160)
+  id                   String           @id @map("_id") @default(uuid(7))
+  name                 String
+  genericName          String?          @map("generic_name")
+  strength             String?
+  dosageForm           String?          @map("dosage_form")
+  packSize             String?          @map("pack_size")
+  manufacturer         String?
   schedule             MedicineSchedule @default(OTC)
   requiresPrescription Boolean          @default(false) @map("requires_prescription")
   isActive             Boolean          @default(true) @map("is_active")
-  createdAt            DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt            DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt            DateTime         @default(now()) @map("created_at")
+  updatedAt            DateTime         @updatedAt @map("updated_at")
 
   inventory  PharmacyInventory[]
   orderItems PharmacyOrderItem[]
 
   @@unique([name, strength, dosageForm, packSize, manufacturer])
-  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "medicines_name_trgm_idx")
+  @@index([name], map: "medicines_name_trgm_idx")
   @@index([genericName])
   @@map("medicines")
 }

@@ -18,6 +18,9 @@ import { integrationsRouter } from './modules/platform/integrations.routes.js';
 import { geoRouter } from './modules/geo/geo.routes.js';
 import { analyticsRouter } from './modules/analytics/analytics.routes.js';
 import { exportsRouter } from './modules/exports/exports.routes.js';
+import { portalRouter } from './modules/portal/portal.routes.js';
+import { patientRouter } from './modules/patient/patient.routes.js';
+import { reviewsRouter } from './modules/reviews/reviews.routes.js';
 
 /** Mounts every module router under /api/v1. */
 export function apiRouter(): Router {
@@ -25,6 +28,7 @@ export function apiRouter(): Router {
   r.use(authRouter());
   r.use(usersRouter());
   r.use(rolesRouter());
+  r.use(reviewsRouter());
   r.use(providersRouter());
   r.use(verificationRouter());
   r.use(catalogueRouter());
@@ -42,5 +46,7 @@ export function apiRouter(): Router {
   r.use(geoRouter());
   r.use(analyticsRouter());
   r.use(exportsRouter());
+  r.use(portalRouter());
+  r.use(patientRouter());
   return r;
 }

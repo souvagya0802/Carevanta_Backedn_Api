@@ -74,7 +74,7 @@ The machine-readable version is `docs/openapi.json` (238 operations) and the liv
 | Launch city: Kolkata vs Hyderabad vs Moyna/Tamluk | Moyna and Tamluk (brief) seeded as PILOT regions | Latest instruction wins; regions are data, not code |
 | Express vs NestJS | Express 5 with a typed route layer (`defineRoute`) that generates OpenAPI from Zod | Brief allows Express; the route layer gives the structure NestJS would without the framework weight |
 | PostGIS vs plain columns | numeric lat/lng + composite index + bounding-box prefilter | Pilot is two blocks; PostGIS adds an extension dependency with no measurable benefit at this scale — revisit when multi-district search slows (see performance doc) |
-| Redis | Not used | No demonstrated need: rate limits are per instance + DB lockout; jobs use pg-boss (PostgreSQL); caching limited to two 30 s in-process TTL caches (platform settings; analytics overview/series) |
+| Redis | Not used | No demonstrated need: rate limits are per instance + DB lockout; jobs use cron schedules with MongoDB leases; caching limited to two 30 s in-process TTL caches (platform settings; analytics overview/series) |
 | Who owns the appointment fee | Slot carries the fee; schedule fee → affiliation fee → doctor default | Facility-set fees are visible to the doctor at invitation time |
 | Who confirms a booking | Provider (setting `booking.require_provider_confirmation`, default on) | Analysis §30 |
 | Who issues invoices | Provider is the seller; platform fee invoiced to provider (not implemented as documents yet) | Needs CA confirmation (open question Q3) |
@@ -93,7 +93,7 @@ The machine-readable version is `docs/openapi.json` (238 operations) and the liv
 | Q7 | Diagnostics: PC-PNDT obligations for ultrasound listings; AERB licence for X-ray/CT | Listing imaging services | Fields captured; `RADIOLOGY_LICENSE` check required for imaging centres |
 | Q8 | Ambulance: permits under the Motor Vehicles Act, liability for a failed dispatch, relationship with 108/112 | Safety | Live dispatch disabled; 112 shown first; escalation workflow |
 | Q9 | DPDP Act 2023: retention periods per record type, children's data (guardian consent), Data Protection Board breach notification timelines, consent manager | Retention and anonymisation policy | Legal holds + anonymisation implemented; retention periods not set |
-| Q10 | Data residency: the Neon project is in us-east-2 (USA). Is that acceptable for Indian health data and RBI payment-data rules? | Hosting choice | Payment data stays with the gateway; recommend an India/Singapore region before launch |
+| Q10 | Data residency: the Atlas cluster region must be checked in the Atlas UI. Is that acceptable for Indian health data and RBI payment-data rules? | Hosting choice | Payment data stays with the gateway; recommend an India/Singapore region before launch |
 | Q11 | Telemedicine (TPG 2020): when (if) to enable teleconsultation | Product phase 2 | `mode` field exists; not enabled |
 | Q12 | Consumer Protection (E-Commerce) Rules 2020: grievance officer, mandatory disclosures | Support process | Support cases + SLA implemented; officer not designated |
 | Q13 | Business defaults: 120-minute patient cancellation cutoff, 7-day settlement hold, walk-in commission off, 15 km search radius | Revenue and UX | Settings, changeable in admin |

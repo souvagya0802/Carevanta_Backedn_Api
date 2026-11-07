@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
+import { aggregate, num } from '../../lib/mongo.js';
 import { PaginationQuery, buildPage, cursorOrderBy, cursorWhere } from '../../lib/pagination.js';
 import { DateTimeString, MoneyInput, Reason, iso, minor } from '../../http/dto.js';
 import { notFound } from '../../lib/errors.js';
@@ -437,15 +438,17 @@ export function financeRouter(): Router {
     query: z.object({ limit: z.coerce.number().int().min(1).max(200).default(50) }),
     response: z.array(z.object({ providerId: z.uuid(), displayName: z.string(), unsettledMinor: z.number().int(), entries: z.number().int(), hasVerifiedPayoutAccount: z.boolean() })),
     handler: async ({ query }) => {
-      const rows = await prisma.$queryRaw<{ provider_id: string; display_name: string; total: bigint; n: bigint; verified: boolean }[]>`
-        SELECT e.provider_id, p.display_name, SUM(e.amount_minor)::bigint AS total, COUNT(*)::bigint AS n,
-               EXISTS (SELECT 1 FROM provider_payout_accounts a WHERE a.provider_id = e.provider_id AND a.status = 'VERIFIED') AS verified
-          FROM provider_ledger_entries e JOIN providers p ON p.id = e.provider_id
-         WHERE e.settlement_item_id IS NULL
-         GROUP BY e.provider_id, p.display_name
-         ORDER BY total DESC
-         LIMIT ${query.limit}`;
-      return rows.map((x) => ({ providerId: x.provider_id, displayName: x.display_name, unsettledMinor: minor(x.total)!, entries: Number(x.n), hasVerifiedPayoutAccount: x.verified }));
+      const rows = await aggregate<{ _id: string; display_name: string; total: bigint | number; n: number; verified: boolean }>(prisma, 'provider_ledger_entries', [
+        { $match: { settlement_item_id: null } },
+        { $group: { _id: '$provider_id', total: { $sum: '$amount_minor' }, n: { $sum: 1 } } },
+        { $sort: { total: -1 } },
+        { $limit: query.limit },
+        { $lookup: { from: 'providers', localField: '_id', foreignField: '_id', as: 'p' } },
+        { $unwind: '$p' },
+        { $lookup: { from: 'provider_payout_accounts', let: { pid: '$_id' }, pipeline: [{ $match: { $expr: { $and: [{ $eq: ['$provider_id', '$$pid'] }, { $eq: ['$status', 'VERIFIED'] }] } } }, { $limit: 1 }], as: 'acct' } },
+        { $project: { display_name: '$p.display_name', total: 1, n: 1, verified: { $gt: [{ $size: '$acct' }, 0] } } },
+      ]);
+      return rows.map((x) => ({ providerId: x._id, displayName: x.display_name, unsettledMinor: num(x.total), entries: num(x.n), hasVerifiedPayoutAccount: x.verified }));
     },
   });
 
@@ -568,7 +571,7 @@ export function financeRouter(): Router {
     tags,
     permissions: ['finance.reconcile'],
     body: z.object({
-      gateway: z.enum(['RAZORPAY', 'TEST_GATEWAY']),
+      gateway: z.enum(['RAZORPAY', 'STRIPE', 'TEST_GATEWAY']),
       from: DateTimeString,
       to: DateTimeString,
       lines: z

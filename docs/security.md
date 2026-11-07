@@ -6,7 +6,7 @@ Patient identity and contact data, clinical documents (reports, prescriptions), 
 
 ## Trust boundaries and actors
 
-Public internet → API (patients, providers, admins, payment gateway webhooks) → PostgreSQL + object storage. Actors: anonymous, patient, provider member (scoped to one provider), platform staff (role-based), super-admin, payment gateway, background worker, database operator.
+Public internet → API (patients, providers, admins, payment gateway webhooks) → MongoDB Atlas + object storage. Actors: anonymous, patient, provider member (scoped to one provider), platform staff (role-based), super-admin, payment gateway, background worker, database operator.
 
 ## Threats and controls (STRIDE-style)
 
@@ -29,7 +29,7 @@ Public internet → API (patients, providers, admins, payment gateway webhooks) 
 | Enumeration | Forgot-password always 202; registration conflict message does not say which field; cross-user 404s | auth tests |
 | CSRF / browser attacks | Bearer tokens (no cookies), CORS allow-list with explicit headers, Helmet CSP/HSTS, `X-Content-Type-Options` | app config |
 | Denial of service | Body limits, request/headers timeouts, per-IP limits, bounded list sizes, statement timeout 15 s, bulk caps | config |
-| Secrets in code | All secrets via validated env; `.env` gitignored; `.env.example` placeholders only; the Neon credential pasted during the brief is treated as exposed and must be rotated | repo review |
+| Secrets in code | All secrets via validated env; `.env` gitignored; `.env.example` placeholders only; the Neon credential pasted during the brief and the Atlas credential pasted on 2026-11-07 are treated as exposed and must be rotated | repo review |
 
 ### Role-management safeguards
 
@@ -50,7 +50,7 @@ Custom-role safeguards: a role may only contain permissions its author holds; a 
 
 ## Security checklist (pre-production)
 
-- [ ] Rotate the Neon password; create least-privilege roles (app runtime without DDL; migrations with DDL)
+- [ ] Rotate the Atlas database user password; give the app user `readWrite` on the application database only, and enable Atlas IP allow-listing
 - [ ] Set `APP_ENV=production`, real `CORS_ORIGINS`, `TRUST_PROXY`, Razorpay keys and webhook secret
 - [ ] Generate fresh `JWT_SECRET` and `DATA_ENCRYPTION_KEY`; store in a secrets manager
 - [ ] Replace local storage driver with object storage; verify documents are not publicly reachable

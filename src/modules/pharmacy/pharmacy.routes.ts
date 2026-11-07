@@ -1,7 +1,8 @@
+import { notifyProviderStaff } from '../notifications/events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
-import { prisma, type Tx } from '../../lib/prisma.js';
+import { prisma, transactionWithRetry, type Tx } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { AppError, badRequest, conflict, notFound, preconditionFailed } from '../../lib/errors.js';
 import { assertTransition, type TransitionMap } from '../../lib/state-machine.js';
@@ -66,6 +67,99 @@ async function load(id: string) {
   if (!o) throw notFound('Pharmacy order');
   return orderDto(o);
 }
+export const loadPharmacyOrder = load;
+
+/** Cursor page of orders; `where` is scoped by the caller (admin: any; portal: one pharmacy). */
+export async function listPharmacyOrders(where: Prisma.PharmacyOrderWhereInput, q: { limit: number; cursor?: string }) {
+  const rows = await prisma.pharmacyOrder.findMany({ where: { ...where, ...cursorWhere(q.cursor) }, include, orderBy: cursorOrderBy(), take: q.limit + 1 });
+  const { items, page } = buildPage(rows, q.limit, (o) => o.createdAt);
+  return { items: items.map(orderDto), page };
+}
+
+export async function listInventory(providerId: string, opts: { expiringWithinDays?: number; locationId?: string; q?: string } = {}) {
+  const rows = await prisma.pharmacyInventory.findMany({
+    where: {
+      providerId,
+      ...(opts.locationId ? { locationId: opts.locationId } : {}),
+      ...(opts.expiringWithinDays ? { expiryDate: { lte: new Date(Date.now() + opts.expiringWithinDays * 86_400_000) } } : {}),
+      ...(opts.q ? { medicine: { name: { contains: opts.q, mode: 'insensitive' } } } : {}),
+    },
+    include: { medicine: { select: { id: true, name: true, strength: true, schedule: true, requiresPrescription: true } }, location: { select: { id: true, name: true } } },
+    orderBy: [{ expiryDate: 'asc' }],
+    take: 1000,
+  });
+  const now = new Date();
+  // Batches expiring within 30 days are never dispensed (see reserve()), so they are not "available" to sell.
+  const sellableAfter = new Date(now.getTime() + 30 * 86_400_000);
+  return rows.map((i) => ({
+    id: i.id,
+    locationId: i.locationId,
+    locationName: i.location.name,
+    medicine: i.medicine,
+    batchNumber: i.batchNumber,
+    expiryDate: isoDate(i.expiryDate),
+    quantityOnHand: i.quantityOnHand,
+    quantityReserved: i.quantityReserved,
+    /** Physically on the shelf and not reserved. */
+    onShelf: i.quantityOnHand - i.quantityReserved,
+    /** What patients can actually order: 0 once the batch is expired or expires within 30 days. */
+    available: i.expiryDate > sellableAfter ? i.quantityOnHand - i.quantityReserved : 0,
+    mrpMinor: minor(i.mrpMinor)!,
+    sellingPriceMinor: minor(i.sellingPriceMinor)!,
+    expired: i.expiryDate < now,
+    expiringSoon: i.expiryDate >= now && i.expiryDate < sellableAfter,
+  }));
+}
+
+export type InventoryInput = { locationId: string; medicineId: string; batchNumber: string; expiryDate: string; quantityOnHand: number; mrpMinor: number; sellingPriceMinor: number };
+
+/** Add or correct a stock batch. Selling price may not exceed MRP; on-hand may not drop below what is reserved. */
+export async function upsertInventory(actorUserId: string, providerId: string, body: InventoryInput) {
+  return transactionWithRetry(async (tx) => {
+    const p = await tx.provider.findUnique({ where: { id: providerId } });
+    if (!p || p.type !== 'PHARMACY') throw notFound('Pharmacy');
+    if (!(await tx.providerLocation.findFirst({ where: { id: body.locationId, providerId: p.id } }))) throw badRequest('Location does not belong to this pharmacy');
+    if (!(await tx.medicine.findFirst({ where: { id: body.medicineId, isActive: true } }))) throw badRequest('Unknown or inactive medicine');
+    if (body.sellingPriceMinor > body.mrpMinor) throw badRequest('Selling price cannot exceed MRP');
+    if (new Date(body.expiryDate) <= new Date()) throw badRequest('This batch has already expired');
+    const existing = await tx.pharmacyInventory.findUnique({ where: { locationId_medicineId_batchNumber: { locationId: body.locationId, medicineId: body.medicineId, batchNumber: body.batchNumber } } });
+    if (existing && body.quantityOnHand < existing.quantityReserved) throw conflict('On-hand quantity cannot go below reserved quantity');
+    const data = { expiryDate: new Date(body.expiryDate), quantityOnHand: body.quantityOnHand, mrpMinor: BigInt(body.mrpMinor), sellingPriceMinor: BigInt(body.sellingPriceMinor) };
+    const row = existing
+      ? await tx.pharmacyInventory.update({ where: { id: existing.id }, data: { ...data, version: { increment: 1 } } })
+      : await tx.pharmacyInventory.create({ data: { providerId: p.id, locationId: body.locationId, medicineId: body.medicineId, batchNumber: body.batchNumber, ...data } });
+    await audit(tx, { action: 'pharmacy.inventory_saved', entityType: 'provider', entityId: p.id, actorUserId, metadata: { inventoryId: row.id, quantityOnHand: body.quantityOnHand } });
+    return { id: row.id, quantityOnHand: row.quantityOnHand, quantityReserved: row.quantityReserved };
+  });
+}
+
+/** Move an order along its lifecycle, releasing or consuming reserved stock as it goes. */
+export async function advancePharmacyOrder(id: string, to: PharmacyOrderStatus, actorUserId: string, reason?: string) {
+  return transactionWithRetry(async (tx) => {
+    const o = await tx.pharmacyOrder.findUnique({ where: { id }, include: { items: true, transaction: true, prescription: true } });
+    if (!o) throw notFound('Pharmacy order');
+    assertTransition('Pharmacy order', PHARMACY_TRANSITIONS, o.status, to);
+    if (to === 'ACCEPTED' && o.status === 'PRESCRIPTION_REVIEW' && o.prescription?.reviewStatus !== 'APPROVED') {
+      throw preconditionFailed('A pharmacist must approve the prescription before the order can be accepted');
+    }
+    if (RELEASES_STOCK.includes(to) && !reason) throw badRequest('A reason is required');
+    const res = await tx.pharmacyOrder.updateMany({
+      where: { id, status: o.status, version: o.version },
+      data: { status: to, statusReason: reason ?? null, version: { increment: 1 }, ...(to === 'DELIVERED' ? { completedAt: new Date() } : {}) },
+    });
+    if (res.count !== 1) throw conflict('The order changed concurrently');
+    for (const item of o.items.filter((i) => i.inventoryId)) {
+      if (RELEASES_STOCK.includes(to)) {
+        await tx.pharmacyInventory.update({ where: { id: item.inventoryId! }, data: { quantityReserved: { decrement: item.quantity }, version: { increment: 1 } } });
+      } else if (to === 'DELIVERED') {
+        await tx.pharmacyInventory.update({ where: { id: item.inventoryId! }, data: { quantityReserved: { decrement: item.quantity }, quantityOnHand: { decrement: item.quantity }, version: { increment: 1 } } });
+      }
+    }
+    if (RELEASES_STOCK.includes(to) && o.transaction) await onSourceCancelled(tx, o.transaction.id, actorUserId, reason!);
+    if (to === 'DELIVERED' && o.transaction) await onServiceCompleted(tx, o.transaction.id, actorUserId);
+    await audit(tx, { action: `pharmacy_order.${to.toLowerCase()}`, entityType: 'pharmacy_order', entityId: id, actorUserId, metadata: { from: o.status, to } });
+  });
+}
 
 /**
  * Reserve stock first-expiry-first-out across batches. Each reservation is a
@@ -81,9 +175,12 @@ async function reserve(tx: Tx, locationId: string, medicineId: string, qty: numb
     if (remaining === 0) break;
     const take = Math.min(remaining, b.quantityOnHand - b.quantityReserved);
     if (take <= 0) continue;
-    const n = await tx.$executeRaw`
-      UPDATE pharmacy_inventory SET quantity_reserved = quantity_reserved + ${take}, version = version + 1, updated_at = now()
-       WHERE id = ${b.id}::uuid AND quantity_on_hand - quantity_reserved >= ${take}`;
+    // Compare-and-set on the batch version: `take` was computed from this exact row state, so a successful
+    // update guarantees on_hand - reserved >= take held; a concurrent change makes the update match nothing.
+    const { count: n } = await tx.pharmacyInventory.updateMany({
+      where: { id: b.id, version: b.version },
+      data: { quantityReserved: { increment: take }, version: { increment: 1 } },
+    });
     if (n === 1) {
       picks.push({ inventoryId: b.id, quantity: take, unitPriceMinor: b.sellingPriceMinor });
       remaining -= take;
@@ -91,6 +188,76 @@ async function reserve(tx: Tx, locationId: string, medicineId: string, qty: numb
   }
   if (remaining > 0) throw new AppError(409, 'CONFLICT', 'Insufficient stock for one or more medicines');
   return picks;
+}
+
+/**
+ * Place a pharmacy order: validates the pharmacy, delivery coverage and
+ * prescription rules, reserves stock (first-expiry-first-out), records the
+ * transaction and tells the pharmacy. Shared by the admin console and the
+ * patient app; the caller says who is ordering and how it is attributed.
+ */
+export async function createPharmacyOrder(input: {
+  patientProfileId: string;
+  providerId: string;
+  locationId: string;
+  fulfilment: 'PICKUP' | 'DELIVERY';
+  deliveryPincode?: string;
+  prescriptionId?: string;
+  items: { medicineId: string; quantity: number }[];
+  source: 'PATIENT_APP' | 'ADMIN_CONSOLE' | 'PROVIDER_PORTAL';
+  attribution: 'PLATFORM' | 'ADMIN_ASSISTED' | 'PROVIDER_DIRECT';
+  payAtProvider: boolean;
+  actorUserId: string;
+}): Promise<string> {
+  return transactionWithRetry(async (tx) => {
+    const patient = await tx.patientProfile.findUnique({ where: { id: input.patientProfileId } });
+    if (!patient) throw notFound('Patient profile');
+    const pharmacy = await tx.provider.findUnique({ where: { id: input.providerId }, include: { pharmacyProfile: true } });
+    if (!pharmacy || pharmacy.type !== 'PHARMACY') throw badRequest('Provider must be a pharmacy');
+    if (pharmacy.status !== 'APPROVED') throw preconditionFailed('This pharmacy is not accepting orders');
+    if (input.fulfilment === 'DELIVERY') {
+      if (!input.deliveryPincode) throw badRequest('deliveryPincode is required for delivery');
+      if (!pharmacy.pharmacyProfile?.homeDeliveryAvailable) throw preconditionFailed('This pharmacy does not deliver');
+      const covered = await tx.providerServiceArea.count({ where: { providerId: pharmacy.id, purpose: 'DELIVERY', OR: [{ pincode: input.deliveryPincode }, { pincode: null }] } });
+      if (!covered) throw preconditionFailed('Delivery is not available at this PIN code');
+    }
+    const medicines = await tx.medicine.findMany({ where: { id: { in: input.items.map((i) => i.medicineId) }, isActive: true } });
+    if (medicines.length !== new Set(input.items.map((i) => i.medicineId)).size) throw badRequest('Unknown or inactive medicine');
+    const needsRx = medicines.some((m) => m.requiresPrescription);
+    if (needsRx) {
+      if (!input.prescriptionId) throw preconditionFailed('A prescription is required for one or more medicines');
+      const rx = await tx.prescription.findFirst({ where: { id: input.prescriptionId, patientProfileId: patient.id } });
+      if (!rx) throw badRequest('Prescription not found for this patient');
+      if (rx.reviewStatus === 'REJECTED') throw preconditionFailed('The prescription was rejected by the pharmacist');
+      if (rx.validUntil && rx.validUntil < new Date()) throw preconditionFailed('The prescription has expired');
+    }
+    const lines: { medicineId: string; inventoryId: string; quantity: number; unitPriceMinor: bigint }[] = [];
+    for (const item of input.items) {
+      for (const pick of await reserve(tx, input.locationId, item.medicineId, item.quantity)) lines.push({ medicineId: item.medicineId, ...pick });
+    }
+    const total = lines.reduce((s, l) => s + l.unitPriceMinor * BigInt(l.quantity), 0n);
+    const order = await tx.pharmacyOrder.create({
+      data: {
+        reference: makeReference(REF.pharmacyOrder),
+        patientProfileId: patient.id,
+        bookedByUserId: patient.accountUserId,
+        providerId: pharmacy.id,
+        locationId: input.locationId,
+        fulfilment: input.fulfilment,
+        deliveryPincode: input.deliveryPincode,
+        prescriptionId: input.prescriptionId,
+        status: needsRx ? 'PRESCRIPTION_REVIEW' : 'PLACED',
+        source: input.source,
+        attribution: input.attribution,
+        totalMinor: total,
+        items: { create: lines },
+      },
+    });
+    await createTransaction(tx, { sourceType: 'PHARMACY_ORDER', sourceId: order.id, providerId: pharmacy.id, patientProfileId: patient.id, grossMinor: total, attribution: input.attribution, payAtProvider: input.payAtProvider });
+    await audit(tx, { action: 'pharmacy_order.created', entityType: 'pharmacy_order', entityId: order.id, actorUserId: input.actorUserId, metadata: { lines: lines.length, needsRx } });
+    await notifyProviderStaff(tx, pharmacy.id, 'manage_bookings', { key: 'portal.pharmacy_order_placed', title: needsRx ? 'New order — prescription to review' : 'New medicine order', body: `${order.reference} · ${patient.fullName} · ${lines.length} item(s)`, link: `/pharmacy-orders?id=${order.id}` });
+    return order.id;
+  });
 }
 
 export function pharmacyRouter(): Router {
@@ -106,27 +273,7 @@ export function pharmacyRouter(): Router {
     params: IdParams,
     query: z.object({ expiringWithinDays: z.coerce.number().int().min(1).max(365).optional() }),
     response: z.array(Passthrough),
-    handler: async ({ params, query }) =>
-      (
-        await prisma.pharmacyInventory.findMany({
-          where: { providerId: params.id, ...(query.expiringWithinDays ? { expiryDate: { lte: new Date(Date.now() + query.expiringWithinDays * 86_400_000) } } : {}) },
-          include: { medicine: { select: { name: true, strength: true, schedule: true } } },
-          orderBy: [{ expiryDate: 'asc' }],
-          take: 1000,
-        })
-      ).map((i) => ({
-        id: i.id,
-        locationId: i.locationId,
-        medicine: i.medicine,
-        batchNumber: i.batchNumber,
-        expiryDate: isoDate(i.expiryDate),
-        quantityOnHand: i.quantityOnHand,
-        quantityReserved: i.quantityReserved,
-        available: i.quantityOnHand - i.quantityReserved,
-        mrpMinor: minor(i.mrpMinor)!,
-        sellingPriceMinor: minor(i.sellingPriceMinor)!,
-        expired: i.expiryDate < new Date(),
-      })),
+    handler: ({ params, query }) => listInventory(params.id, query),
   });
 
   defineRoute(r, '/admin/pharmacies', {
@@ -148,21 +295,7 @@ export function pharmacyRouter(): Router {
       sellingPriceMinor: MoneyInput,
     }),
     response: Passthrough,
-    handler: async ({ params, body, auth }) =>
-      prisma.$transaction(async (tx) => {
-        const p = await tx.provider.findUnique({ where: { id: params.id } });
-        if (!p || p.type !== 'PHARMACY') throw notFound('Pharmacy');
-        if (!(await tx.providerLocation.findFirst({ where: { id: body.locationId, providerId: p.id } }))) throw badRequest('Location does not belong to this pharmacy');
-        if (body.sellingPriceMinor > body.mrpMinor) throw badRequest('Selling price cannot exceed MRP');
-        const existing = await tx.pharmacyInventory.findUnique({ where: { locationId_medicineId_batchNumber: { locationId: body.locationId, medicineId: body.medicineId, batchNumber: body.batchNumber } } });
-        if (existing && body.quantityOnHand < existing.quantityReserved) throw conflict('On-hand quantity cannot go below reserved quantity');
-        const data = { expiryDate: new Date(body.expiryDate), quantityOnHand: body.quantityOnHand, mrpMinor: BigInt(body.mrpMinor), sellingPriceMinor: BigInt(body.sellingPriceMinor) };
-        const row = existing
-          ? await tx.pharmacyInventory.update({ where: { id: existing.id }, data: { ...data, version: { increment: 1 } } })
-          : await tx.pharmacyInventory.create({ data: { providerId: p.id, locationId: body.locationId, medicineId: body.medicineId, batchNumber: body.batchNumber, ...data } });
-        await audit(tx, { action: 'pharmacy.inventory_saved', entityType: 'provider', entityId: p.id, actorUserId: auth.userId, metadata: { inventoryId: row.id, quantityOnHand: body.quantityOnHand } });
-        return { id: row.id, quantityOnHand: row.quantityOnHand, quantityReserved: row.quantityReserved };
-      }),
+    handler: ({ params, body, auth }) => upsertInventory(auth.userId, params.id, body),
   });
 
   defineRoute(r, '/admin/pharmacy-orders', {
@@ -174,16 +307,7 @@ export function pharmacyRouter(): Router {
     permissions: ['pharmacy.read'],
     query: PaginationQuery.extend({ status: StatusEnum.optional(), providerId: z.uuid().optional() }),
     response: Passthrough,
-    handler: async ({ query }) => {
-      const rows = await prisma.pharmacyOrder.findMany({
-        where: { ...(query.status ? { status: query.status } : {}), ...(query.providerId ? { providerId: query.providerId } : {}), ...cursorWhere(query.cursor) },
-        include,
-        orderBy: cursorOrderBy(),
-        take: query.limit + 1,
-      });
-      const { items, page } = buildPage(rows, query.limit, (o) => o.createdAt);
-      return { items: items.map(orderDto), page };
-    },
+    handler: ({ query }) => listPharmacyOrders({ ...(query.status ? { status: query.status } : {}), ...(query.providerId ? { providerId: query.providerId } : {}) }, query),
   });
 
   defineRoute(r, '/admin/pharmacy-orders', {
@@ -217,83 +341,12 @@ export function pharmacyRouter(): Router {
     }),
     response: Passthrough,
     handler: async ({ body, auth }) => {
-      const id = await prisma.$transaction(async (tx) => {
-        const patient = await tx.patientProfile.findUnique({ where: { id: body.patientProfileId } });
-        if (!patient) throw notFound('Patient profile');
-        const pharmacy = await tx.provider.findUnique({ where: { id: body.providerId }, include: { pharmacyProfile: true } });
-        if (!pharmacy || pharmacy.type !== 'PHARMACY') throw badRequest('Provider must be a pharmacy');
-        if (pharmacy.status !== 'APPROVED') throw preconditionFailed('This pharmacy is not accepting orders');
-        if (body.fulfilment === 'DELIVERY') {
-          if (!body.deliveryPincode) throw badRequest('deliveryPincode is required for delivery');
-          if (!pharmacy.pharmacyProfile?.homeDeliveryAvailable) throw preconditionFailed('This pharmacy does not deliver');
-          const covered = await tx.providerServiceArea.count({ where: { providerId: pharmacy.id, purpose: 'DELIVERY', OR: [{ pincode: body.deliveryPincode }, { pincode: null }] } });
-          if (!covered) throw preconditionFailed('Delivery is not available at this PIN code');
-        }
-        const medicines = await tx.medicine.findMany({ where: { id: { in: body.items.map((i) => i.medicineId) }, isActive: true } });
-        if (medicines.length !== new Set(body.items.map((i) => i.medicineId)).size) throw badRequest('Unknown or inactive medicine');
-        const needsRx = medicines.some((m) => m.requiresPrescription);
-        if (needsRx) {
-          if (!body.prescriptionId) throw preconditionFailed('A prescription is required for one or more medicines');
-          const rx = await tx.prescription.findFirst({ where: { id: body.prescriptionId, patientProfileId: patient.id } });
-          if (!rx) throw badRequest('Prescription not found for this patient');
-          if (rx.reviewStatus === 'REJECTED') throw preconditionFailed('The prescription was rejected by the pharmacist');
-          if (rx.validUntil && rx.validUntil < new Date()) throw preconditionFailed('The prescription has expired');
-        }
-        const lines: { medicineId: string; inventoryId: string; quantity: number; unitPriceMinor: bigint }[] = [];
-        for (const item of body.items) {
-          for (const pick of await reserve(tx, body.locationId, item.medicineId, item.quantity)) lines.push({ medicineId: item.medicineId, ...pick });
-        }
-        const total = lines.reduce((s, l) => s + l.unitPriceMinor * BigInt(l.quantity), 0n);
-        const order = await tx.pharmacyOrder.create({
-          data: {
-            reference: makeReference(REF.pharmacyOrder),
-            patientProfileId: patient.id,
-            bookedByUserId: patient.accountUserId,
-            providerId: pharmacy.id,
-            locationId: body.locationId,
-            fulfilment: body.fulfilment,
-            deliveryPincode: body.deliveryPincode,
-            prescriptionId: body.prescriptionId,
-            status: needsRx ? 'PRESCRIPTION_REVIEW' : 'PLACED',
-            source: 'ADMIN_CONSOLE',
-            attribution: 'ADMIN_ASSISTED',
-            totalMinor: total,
-            items: { create: lines },
-          },
-        });
-        await createTransaction(tx, { sourceType: 'PHARMACY_ORDER', sourceId: order.id, providerId: pharmacy.id, patientProfileId: patient.id, grossMinor: total, attribution: 'ADMIN_ASSISTED', payAtProvider: true });
-        await audit(tx, { action: 'pharmacy_order.created', entityType: 'pharmacy_order', entityId: order.id, actorUserId: auth.userId, metadata: { lines: lines.length, needsRx } });
-        return order.id;
-      });
+      const id = await createPharmacyOrder({ ...body, source: 'ADMIN_CONSOLE', attribution: 'ADMIN_ASSISTED', payAtProvider: true, actorUserId: auth.userId });
       return load(id);
     },
   });
 
-  const advance = async (id: string, to: PharmacyOrderStatus, actorUserId: string, reason?: string) =>
-    prisma.$transaction(async (tx) => {
-      const o = await tx.pharmacyOrder.findUnique({ where: { id }, include: { items: true, transaction: true, prescription: true } });
-      if (!o) throw notFound('Pharmacy order');
-      assertTransition('Pharmacy order', PHARMACY_TRANSITIONS, o.status, to);
-      if (to === 'ACCEPTED' && o.status === 'PRESCRIPTION_REVIEW' && o.prescription?.reviewStatus !== 'APPROVED') {
-        throw preconditionFailed('A pharmacist must approve the prescription before the order can be accepted');
-      }
-      if (RELEASES_STOCK.includes(to) && !reason) throw badRequest('A reason is required');
-      const res = await tx.pharmacyOrder.updateMany({
-        where: { id, status: o.status, version: o.version },
-        data: { status: to, statusReason: reason ?? null, version: { increment: 1 }, ...(to === 'DELIVERED' ? { completedAt: new Date() } : {}) },
-      });
-      if (res.count !== 1) throw conflict('The order changed concurrently');
-      for (const item of o.items.filter((i) => i.inventoryId)) {
-        if (RELEASES_STOCK.includes(to)) {
-          await tx.$executeRaw`UPDATE pharmacy_inventory SET quantity_reserved = quantity_reserved - ${item.quantity}, updated_at = now() WHERE id = ${item.inventoryId}::uuid`;
-        } else if (to === 'DELIVERED') {
-          await tx.$executeRaw`UPDATE pharmacy_inventory SET quantity_reserved = quantity_reserved - ${item.quantity}, quantity_on_hand = quantity_on_hand - ${item.quantity}, updated_at = now() WHERE id = ${item.inventoryId}::uuid`;
-        }
-      }
-      if (RELEASES_STOCK.includes(to) && o.transaction) await onSourceCancelled(tx, o.transaction.id, actorUserId, reason!);
-      if (to === 'DELIVERED' && o.transaction) await onServiceCompleted(tx, o.transaction.id, actorUserId);
-      await audit(tx, { action: `pharmacy_order.${to.toLowerCase()}`, entityType: 'pharmacy_order', entityId: id, actorUserId, metadata: { from: o.status, to } });
-    });
+  const advance = advancePharmacyOrder;
 
   defineRoute(r, '/admin/pharmacy-orders', {
     method: 'post',

@@ -1,3 +1,4 @@
+import { notifyProviderStaff, notifyUsers } from '../notifications/events.js';
 import { prisma, type Tx } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
@@ -31,7 +32,7 @@ export interface AffiliationTerms {
 }
 
 const include = {
-  doctor: { select: { id: true, displayName: true, status: true } },
+  doctor: { select: { id: true, displayName: true, status: true, ratingAverage: true, ratingCount: true, doctorProfile: { select: { yearsOfExperience: true, specialities: { where: { verified: true }, orderBy: { isPrimary: 'desc' as const }, select: { isPrimary: true, speciality: { select: { code: true, name: true } } } } } } } },
   facility: { select: { id: true, displayName: true, type: true, status: true } },
   location: { select: { id: true, name: true } },
   department: { select: { code: true, name: true } },
@@ -43,7 +44,16 @@ export function affiliationDto(a: Prisma.DoctorAffiliationGetPayload<{ include: 
     id: a.id,
     status: a.status,
     initiatedBy: a.initiatedBy,
-    doctor: a.doctor,
+    // The doctor's own verified specialities travel with the affiliation so a facility never confuses them with the department it filed the doctor under.
+    doctor: {
+      id: a.doctor.id,
+      displayName: a.doctor.displayName,
+      status: a.doctor.status,
+      specialities: a.doctor.doctorProfile?.specialities.map((s) => s.speciality.name) ?? [],
+      yearsOfExperience: a.doctor.doctorProfile?.yearsOfExperience ?? null,
+      ratingAverage: a.doctor.ratingAverage ? Number(a.doctor.ratingAverage) : null,
+      ratingCount: a.doctor.ratingCount,
+    },
     facility: a.facility,
     location: a.location,
     department: a.department,
@@ -70,12 +80,16 @@ export async function getAffiliation(id: string) {
   return affiliationDto(a);
 }
 
-export async function listAffiliations(q: { limit: number; cursor?: string; status?: AffiliationStatus; doctorProviderId?: string; facilityProviderId?: string }) {
+export async function listAffiliations(q: { limit: number; cursor?: string; status?: AffiliationStatus; doctorProviderId?: string; facilityProviderId?: string; departmentCode?: string; specialityCode?: string; engagementType?: string; q?: string }) {
   const rows = await prisma.doctorAffiliation.findMany({
     where: {
       ...(q.status ? { status: q.status } : {}),
       ...(q.doctorProviderId ? { doctorProviderId: q.doctorProviderId } : {}),
       ...(q.facilityProviderId ? { facilityProviderId: q.facilityProviderId } : {}),
+      ...(q.departmentCode ? { department: { code: q.departmentCode } } : {}),
+      ...(q.engagementType ? { engagementType: q.engagementType as never } : {}),
+      ...(q.specialityCode ? { doctor: { doctorProfile: { specialities: { some: { speciality: { code: q.specialityCode } } } } } } : {}),
+      ...(q.q ? { OR: [{ doctor: { displayName: { contains: q.q, mode: 'insensitive' } } }, { facility: { displayName: { contains: q.q, mode: 'insensitive' } } }] } : {}),
       ...cursorWhere(q.cursor),
     },
     include,
@@ -147,6 +161,12 @@ async function createAffiliation(
       });
       await tx.affiliationEvent.create({ data: { affiliationId: a.id, fromStatus: null, toStatus: status, actorUserId: actor.userId, actorKind: kind, note } });
       await audit(tx, { action: 'affiliation.created', entityType: 'affiliation', entityId: a.id, metadata: { kind, doctorProviderId, facilityProviderId } });
+      if (kind === 'FACILITY') {
+        const dp = await tx.doctorProfile.findUnique({ where: { providerId: doctorProviderId }, select: { userId: true } });
+        if (dp) await notifyUsers(tx, [dp.userId], { key: 'portal.affiliation_invited', title: 'A hospital or clinic invited you', body: 'Open Hospitals & Clinics to accept or decline', link: '/affiliations', exceptUserId: actor.userId });
+      } else if (kind === 'DOCTOR') {
+        await notifyProviderStaff(tx, facilityProviderId, 'manage_affiliations', { key: 'portal.affiliation_requested', title: 'A doctor asked to join', body: 'Open Doctors to accept or decline', link: '/affiliations', exceptUserId: actor.userId });
+      }
       return a.id;
     });
   } catch (err) {

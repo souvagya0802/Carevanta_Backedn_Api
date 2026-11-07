@@ -1,3 +1,4 @@
+import { notifyProviderStaffMany } from '../notifications/events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -38,7 +39,6 @@ export const DISPATCH_TRANSITIONS: TransitionMap<DispatchStatus> = {
   CANCELLED: [],
 };
 
-const VehicleTypeEnum = z.enum(['BLS', 'ALS', 'PATIENT_TRANSPORT', 'NEONATAL', 'MORTUARY']);
 const Passthrough = z.object({ id: z.uuid() }).passthrough();
 
 async function moveDispatch(tx: Tx, id: string, to: DispatchStatus, actor: { userId: string | null; kind: string }, note?: string) {
@@ -64,7 +64,7 @@ const include = {
   events: { orderBy: { createdAt: 'asc' as const } },
 } satisfies Prisma.DispatchRequestInclude;
 
-function dispatchDto(d: Prisma.DispatchRequestGetPayload<{ include: typeof include }>) {
+export function dispatchDto(d: Prisma.DispatchRequestGetPayload<{ include: typeof include }>) {
   const accepted = d.assignments.find((a) => a.status === 'ACCEPTED' || a.status === 'COMPLETED');
   return {
     id: d.id,
@@ -75,6 +75,7 @@ function dispatchDto(d: Prisma.DispatchRequestGetPayload<{ include: typeof inclu
     pickupDistrict: d.pickupDistrict,
     pickupLatitude: dec(d.pickupLatitude),
     pickupLongitude: dec(d.pickupLongitude),
+    pickupAddress: d.pickupAddress ?? null,
     requiredVehicleType: d.requiredVehicleType,
     // Only true when an operator confirmed — never inferred.
     ambulanceConfirmed: !!accepted,
@@ -97,7 +98,7 @@ function dispatchDto(d: Prisma.DispatchRequestGetPayload<{ include: typeof inclu
   };
 }
 
-async function loadDispatch(id: string) {
+export async function loadDispatch(id: string) {
   const d = await prisma.dispatchRequest.findUnique({ where: { id }, include });
   if (!d) throw notFound('Dispatch request');
   return dispatchDto(d);
@@ -153,6 +154,7 @@ async function openRequest(input: {
         }
       }
       if (offers > 0) await moveDispatch(tx, req.id, 'OFFERED', { userId: null, kind: 'SYSTEM' }, `${offers} operator(s) notified`);
+      if (offers > 0) await notifyProviderStaffMany(tx, operators.map((o) => o.id), 'manage_dispatch', { key: 'portal.dispatch_offer', title: 'Emergency request — accept now', body: `${req.reference} · ${input.district ?? 'location pending'}`, link: '/dispatch', urgent: true });
       else await moveDispatch(tx, req.id, 'NO_PROVIDER_AVAILABLE', { userId: null, kind: 'SYSTEM' }, input.mode === 'TEST' ? 'Test drill: no operators notified' : 'No covering operator with an available vehicle');
     } else {
       await moveDispatch(tx, req.id, 'NO_PROVIDER_AVAILABLE', { userId: null, kind: 'SYSTEM' }, 'Live dispatch is not enabled; caller directed to 112');
@@ -162,12 +164,8 @@ async function openRequest(input: {
   });
 }
 
-export function ambulanceRouter(): Router {
-  const r = Router();
-  const tags = ['Admin · Ambulance'];
-
-  // ── Vehicles & crew ────────────────────────────────────────────────────
-  const vehicleDto = (v: any) => ({
+// ── Fleet helpers shared by the admin console and the operator portal ──────
+export const vehicleDto = (v: any) => ({
     id: v.id,
     operatorProviderId: v.operatorProviderId,
     operatorName: v.operator?.displayName,
@@ -183,6 +181,79 @@ export function ambulanceRouter(): Router {
     createdAt: v.createdAt.toISOString(),
   });
 
+export const VehicleTypeEnum = z.enum(['BLS', 'ALS', 'PATIENT_TRANSPORT', 'NEONATAL', 'MORTUARY']);
+export const VehicleInput = z.object({
+  registrationNumber: z.string().toUpperCase().regex(/^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$/, 'Indian registration format, e.g. WB29AB1234'),
+  vehicleType: VehicleTypeEnum,
+  equipment: z.array(z.string().max(64)).max(40).default([]),
+  insuranceValidUntil: DateString,
+  fitnessValidUntil: DateString.optional(),
+  baseLocationId: z.uuid().optional(),
+});
+export const CrewInput = z.object({ fullName: z.string().trim().min(2).max(160), role: z.enum(['DRIVER', 'EMT', 'PARAMEDIC', 'NURSE']), licenseNumber: z.string().max(64).optional(), licenseValidUntil: DateString.optional() });
+
+export async function listVehicles(operatorProviderId: string) {
+  const rows = await prisma.ambulanceVehicle.findMany({ where: { operatorProviderId }, include: { operator: { select: { displayName: true } } }, orderBy: { createdAt: 'asc' } });
+  return rows.map(vehicleDto);
+}
+
+/** New vehicles start PENDING_VERIFICATION; only the platform can make them AVAILABLE. */
+export async function registerVehicle(actorUserId: string, operatorProviderId: string, body: z.infer<typeof VehicleInput>) {
+  const op = await prisma.provider.findUnique({ where: { id: operatorProviderId } });
+  if (!op || op.type !== 'AMBULANCE_OPERATOR') throw badRequest('Provider must be an ambulance operator');
+  if (new Date(body.insuranceValidUntil) < new Date()) throw badRequest('Vehicle insurance has expired');
+  if (body.baseLocationId && !(await prisma.providerLocation.findFirst({ where: { id: body.baseLocationId, providerId: op.id } }))) throw badRequest('Base location does not belong to this operator');
+  try {
+    const v = await prisma.$transaction(async (tx) => {
+      const created = await tx.ambulanceVehicle.create({
+        data: {
+          operatorProviderId: op.id,
+          registrationNumber: body.registrationNumber,
+          vehicleType: body.vehicleType,
+          equipment: body.equipment,
+          insuranceValidUntil: new Date(body.insuranceValidUntil),
+          fitnessValidUntil: body.fitnessValidUntil ? new Date(body.fitnessValidUntil) : null,
+          baseLocationId: body.baseLocationId,
+        },
+        include: { operator: { select: { displayName: true } } },
+      });
+      await audit(tx, { action: 'ambulance.vehicle_registered', entityType: 'ambulance_vehicle', entityId: created.id, actorUserId, metadata: { registrationNumber: body.registrationNumber } });
+      return created;
+    });
+    return vehicleDto(v);
+  } catch (err) {
+    if (isPgError(err, '23505')) throw conflict('A vehicle with this registration number already exists');
+    throw err;
+  }
+}
+
+export async function listCrew(operatorProviderId: string) {
+  return (await prisma.ambulanceCrewMember.findMany({ where: { operatorProviderId }, orderBy: { createdAt: 'asc' } })).map((c) => ({
+    id: c.id,
+    fullName: c.fullName,
+    role: c.role,
+    licenseNumber: c.licenseNumber,
+    licenseValidUntil: isoDate(c.licenseValidUntil),
+    licenseExpired: !!(c.licenseValidUntil && c.licenseValidUntil < new Date()),
+    isActive: c.isActive,
+  }));
+}
+
+export async function addCrew(actorUserId: string, operatorProviderId: string, body: z.infer<typeof CrewInput>) {
+  const op = await prisma.provider.findUnique({ where: { id: operatorProviderId } });
+  if (!op || op.type !== 'AMBULANCE_OPERATOR') throw notFound('Ambulance operator');
+  if (body.role === 'DRIVER' && !body.licenseNumber) throw badRequest('Drivers need a driving licence number');
+  if (body.licenseValidUntil && new Date(body.licenseValidUntil) < new Date()) throw badRequest('The licence has already expired');
+  const c = await prisma.ambulanceCrewMember.create({ data: { operatorProviderId: op.id, ...body, licenseValidUntil: body.licenseValidUntil ? new Date(body.licenseValidUntil) : null } });
+  await audit(prisma, { action: 'ambulance.crew_added', entityType: 'provider', entityId: op.id, actorUserId, metadata: { crewId: c.id, role: c.role } });
+  return { id: c.id, fullName: c.fullName, role: c.role };
+}
+
+export function ambulanceRouter(): Router {
+  const r = Router();
+  const tags = ['Admin · Ambulance'];
+
+  // ── Vehicles & crew ────────────────────────────────────────────────────
   defineRoute(r, '/admin/ambulance', {
     kind: 'list',
     method: 'get',
@@ -210,42 +281,11 @@ export function ambulanceRouter(): Router {
     summary: 'Register an ambulance vehicle',
     tags,
     permissions: ['ambulance.manage'],
-    body: z.object({
-      operatorProviderId: z.uuid(),
-      registrationNumber: z.string().toUpperCase().regex(/^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$/, 'Indian registration format, e.g. WB29AB1234'),
-      vehicleType: VehicleTypeEnum,
-      equipment: z.array(z.string().max(64)).max(40).default([]),
-      insuranceValidUntil: DateString,
-      fitnessValidUntil: DateString.optional(),
-      baseLocationId: z.uuid().optional(),
-    }),
+    body: VehicleInput.extend({ operatorProviderId: z.uuid() }),
     response: Passthrough,
-    handler: async ({ body, auth }) => {
-      const op = await prisma.provider.findUnique({ where: { id: body.operatorProviderId } });
-      if (!op || op.type !== 'AMBULANCE_OPERATOR') throw badRequest('operatorProviderId must be an ambulance operator');
-      if (new Date(body.insuranceValidUntil) < new Date()) throw badRequest('Vehicle insurance has expired');
-      try {
-        const v = await prisma.$transaction(async (tx) => {
-          const created = await tx.ambulanceVehicle.create({
-            data: {
-              operatorProviderId: op.id,
-              registrationNumber: body.registrationNumber,
-              vehicleType: body.vehicleType,
-              equipment: body.equipment,
-              insuranceValidUntil: new Date(body.insuranceValidUntil),
-              fitnessValidUntil: body.fitnessValidUntil ? new Date(body.fitnessValidUntil) : null,
-              baseLocationId: body.baseLocationId,
-            },
-            include: { operator: { select: { displayName: true } } },
-          });
-          await audit(tx, { action: 'ambulance.vehicle_registered', entityType: 'ambulance_vehicle', entityId: created.id, actorUserId: auth.userId, metadata: { registrationNumber: created.registrationNumber } });
-          return created;
-        });
-        return vehicleDto(v);
-      } catch (err) {
-        if (isPgError(err, '23505')) throw conflict('A vehicle with this registration number already exists');
-        throw err;
-      }
+    handler: ({ body, auth }) => {
+      const { operatorProviderId, ...vehicle } = body;
+      return registerVehicle(auth.userId, operatorProviderId, vehicle);
     },
   });
 
@@ -287,15 +327,7 @@ export function ambulanceRouter(): Router {
     permissions: ['ambulance.read'],
     params: IdParams,
     response: z.array(Passthrough),
-    handler: async ({ params }) =>
-      (await prisma.ambulanceCrewMember.findMany({ where: { operatorProviderId: params.id }, orderBy: { createdAt: 'asc' } })).map((c) => ({
-        id: c.id,
-        fullName: c.fullName,
-        role: c.role,
-        licenseNumber: c.licenseNumber,
-        licenseValidUntil: isoDate(c.licenseValidUntil),
-        isActive: c.isActive,
-      })),
+    handler: ({ params }) => listCrew(params.id),
   });
 
   defineRoute(r, '/admin/ambulance', {
@@ -305,16 +337,9 @@ export function ambulanceRouter(): Router {
     tags,
     permissions: ['ambulance.manage'],
     params: IdParams,
-    body: z.object({ fullName: z.string().trim().min(2).max(160), role: z.enum(['DRIVER', 'EMT', 'PARAMEDIC', 'NURSE']), licenseNumber: z.string().max(64).optional(), licenseValidUntil: DateString.optional() }),
+    body: CrewInput,
     response: Passthrough,
-    handler: async ({ params, body }) => {
-      const op = await prisma.provider.findUnique({ where: { id: params.id } });
-      if (!op || op.type !== 'AMBULANCE_OPERATOR') throw notFound('Ambulance operator');
-      if (body.role === 'DRIVER' && !body.licenseNumber) throw badRequest('Drivers need a driving licence number');
-      const c = await prisma.ambulanceCrewMember.create({ data: { operatorProviderId: op.id, ...body, licenseValidUntil: body.licenseValidUntil ? new Date(body.licenseValidUntil) : null } });
-      await audit(prisma, { action: 'ambulance.crew_added', entityType: 'provider', entityId: op.id, metadata: { crewId: c.id, role: c.role } });
-      return { id: c.id, fullName: c.fullName, role: c.role };
-    },
+    handler: ({ params, body, auth }) => addCrew(auth.userId, params.id, body),
   });
 
   // ── Dispatch: patient entry point ──────────────────────────────────────
@@ -492,6 +517,27 @@ export function ambulanceRouter(): Router {
         requiredVehicleType: a.request.requiredVehicleType,
         offeredAt: a.offeredAt.toISOString(),
       }));
+    },
+  });
+
+  defineRoute(r, op, {
+    method: 'get',
+    path: '/active',
+    summary: 'Trips this operator has accepted and not yet completed (survives an app reload)',
+    tags: opTags,
+    params: z.object({ providerId: z.uuid() }),
+    response: z.array(Passthrough),
+    handler: async ({ params, auth }) => {
+      await assertProviderAccess(auth, params.providerId, { capability: 'manage_dispatch' });
+      const rows = await prisma.dispatchAssignment.findMany({
+        where: { operatorProviderId: params.providerId, status: 'ACCEPTED', request: { status: { in: ['ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'PATIENT_ONBOARD', 'AT_DESTINATION'] } } },
+        select: { requestId: true },
+        orderBy: { respondedAt: 'asc' },
+        take: 20,
+      });
+      const trips = await prisma.dispatchRequest.findMany({ where: { id: { in: rows.map((a) => a.requestId) } }, include, orderBy: { createdAt: 'asc' } });
+      // The accepted operator needs to reach the caller and find the pickup; these fields are never on the public DTO.
+      return trips.map((t) => ({ ...dispatchDto(t), callerPhone: t.callerPhone, pickupAddress: t.pickupAddress }));
     },
   });
 

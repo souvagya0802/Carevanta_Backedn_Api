@@ -1,4 +1,5 @@
 import { City, Country, State } from 'country-state-city';
+import { geocodePincode } from './geocoder.js';
 import { AppError, badRequest, notFound } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 
@@ -111,4 +112,58 @@ export async function lookupPincode(raw: string, fetchImpl: typeof fetch = fetch
 /** Test hook. */
 export function clearPincodeCache() {
   pinCache.clear();
+}
+
+/* ─── Approximate coordinates for a PIN code ─────────────────────────────── */
+
+export type CoordinateSource = 'providers' | 'locality' | 'district' | 'state';
+export interface ApproximateCoordinates { latitude: number | null; longitude: number | null; accuracy: CoordinateSource | null }
+
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z]/g, '');
+
+/**
+ * India Post gives names, not coordinates. For distance sorting we take, in
+ * order: the centre of verified provider locations at this PIN, a town in the
+ * country-state-city dataset matching a post office, the block or the district,
+ * and finally the state centre. `accuracy` tells the app how approximate it is.
+ * All data-driven: no place is hard-coded.
+ */
+export async function approximateCoordinates(r: PincodeResult): Promise<ApproximateCoordinates> {
+  const { prisma } = await import('../../lib/prisma.js');
+  const { aggregate } = await import('../../lib/mongo.js');
+  const at = await aggregate<{ lat: number | null; lng: number | null }>(prisma, 'provider_locations', [
+    { $match: { pincode: r.pincode, is_active: true, latitude: { $type: 'number' }, longitude: { $type: 'number' } } },
+    { $lookup: { from: 'providers', localField: 'provider_id', foreignField: '_id', as: 'p' } },
+    { $unwind: '$p' },
+    { $match: { 'p.status': 'APPROVED' } },
+    { $group: { _id: null, lat: { $avg: '$latitude' }, lng: { $avg: '$longitude' } } },
+  ]);
+  if (at[0]?.lat != null && at[0]?.lng != null) return { latitude: Math.round(at[0].lat * 1e5) / 1e5, longitude: Math.round(at[0].lng * 1e5) / 1e5, accuracy: 'providers' };
+
+  const country = Country.getAllCountries().find((c) => norm(c.name) === norm(r.country)) ?? Country.getCountryByCode('IN');
+  const state = country ? State.getStatesOfCountry(country.isoCode).find((s) => norm(s.name) === norm(r.state)) : undefined;
+  if (country && state) {
+    const cities = City.getCitiesOfState(country.isoCode, state.isoCode);
+    const byName = new Map(cities.map((c) => [norm(c.name), c]));
+    const officeWords = r.offices.flatMap((o) => [o.name, o.name.replace(/\s+(B\.?O|S\.?O|H\.?O)\.?$/i, '')]);
+    for (const [names, accuracy] of [[officeWords, 'locality'], [[r.block ?? ''], 'locality'], [[r.district, r.district.replace(/^(purba|paschim|uttar|dakshin|north|south|east|west)\s+/i, '')], 'district']] as const) {
+      for (const n of names) {
+        const c = n ? byName.get(norm(n)) : undefined;
+        const lat = num(c?.latitude), lng = num(c?.longitude);
+        if (lat != null && lng != null) {
+          // A district-level match is coarse: ask the geocoder for the PIN's own centre first (cached, best effort).
+          if (accuracy === 'district') {
+            const exact = await geocodePincode(r.pincode);
+            if (exact) return { ...exact, accuracy: 'locality' };
+          }
+          return { latitude: lat, longitude: lng, accuracy };
+        }
+      }
+    }
+    const exact = await geocodePincode(r.pincode);
+    if (exact) return { ...exact, accuracy: 'locality' };
+    const lat = num(state.latitude), lng = num(state.longitude);
+    if (lat != null && lng != null) return { latitude: lat, longitude: lng, accuracy: 'state' };
+  }
+  return { latitude: null, longitude: null, accuracy: null };
 }

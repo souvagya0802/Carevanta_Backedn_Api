@@ -74,28 +74,28 @@ enum IncidentStatus {
 }
 
 model SupportCase {
-  id             String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference      String              @unique @db.VarChar(24)
+  id             String              @id @map("_id") @default(uuid(7))
+  reference      String              @unique
   type           SupportCaseType
-  category       String              @db.VarChar(64)
+  category       String
   priority       SupportCasePriority @default(MEDIUM)
   status         SupportCaseStatus   @default(OPEN)
-  subject        String              @db.VarChar(200)
-  description    String              @db.VarChar(5000)
-  reporterUserId String?             @map("reporter_user_id") @db.Uuid
-  providerId     String?             @map("provider_id") @db.Uuid
-  transactionId  String?             @map("transaction_id") @db.Uuid
-  assignedToId   String?             @map("assigned_to_id") @db.Uuid
-  slaDueAt       DateTime?           @map("sla_due_at") @db.Timestamptz(3)
-  resolution     String?             @db.VarChar(5000)
-  resolvedAt     DateTime?           @map("resolved_at") @db.Timestamptz(3)
-  createdById    String?             @map("created_by_id") @db.Uuid
+  subject        String
+  description    String
+  reporterUserId String?             @map("reporter_user_id")
+  providerId     String?             @map("provider_id")
+  transactionId  String?             @map("transaction_id")
+  assignedToId   String?             @map("assigned_to_id")
+  slaDueAt       DateTime?           @map("sla_due_at")
+  resolution     String?
+  resolvedAt     DateTime?           @map("resolved_at")
+  createdById    String?             @map("created_by_id")
   version        Int                 @default(1)
-  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
 
-  provider    Provider?           @relation(fields: [providerId], references: [id], onDelete: Restrict)
-  transaction ServiceTransaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  provider    Provider?           @relation(fields: [providerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  transaction ServiceTransaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   events      SupportCaseEvent[]
 
   @@index([status, priority, createdAt(sort: Desc)])
@@ -106,16 +106,16 @@ model SupportCase {
 }
 
 model SupportCaseEvent {
-  id         String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  caseId     String   @map("case_id") @db.Uuid
-  authorId   String?  @map("author_id") @db.Uuid
-  kind       String   @db.VarChar(24) // COMMENT | STATUS_CHANGE | ASSIGNMENT | ESCALATION
-  body       String?  @db.VarChar(5000)
+  id         String   @id @map("_id") @default(uuid(7))
+  caseId     String   @map("case_id")
+  authorId   String?  @map("author_id")
+  kind       String // COMMENT | STATUS_CHANGE | ASSIGNMENT | ESCALATION
+  body       String?
   isInternal Boolean  @default(true) @map("is_internal")
   metadata   Json?
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @map("created_at")
 
-  case SupportCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  case SupportCase @relation(fields: [caseId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([caseId, createdAt])
   @@map("support_case_events")
@@ -123,32 +123,32 @@ model SupportCaseEvent {
 
 /// Internal note on any entity (provider, user, transaction…).
 model AdminNote {
-  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  subjectType String   @map("subject_type") @db.VarChar(48)
-  subjectId   String   @map("subject_id") @db.Uuid
-  authorId    String   @map("author_id") @db.Uuid
-  body        String   @db.VarChar(5000)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  id          String   @id @map("_id") @default(uuid(7))
+  subjectType String   @map("subject_type")
+  subjectId   String   @map("subject_id")
+  authorId    String   @map("author_id")
+  body        String
+  createdAt   DateTime @default(now()) @map("created_at")
 
   @@index([subjectType, subjectId, createdAt(sort: Desc)])
   @@map("admin_notes")
 }
 
 model NotificationTemplate {
-  id        String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  key       String              @db.VarChar(96)
+  id        String              @id @map("_id") @default(uuid(7))
+  key       String
   channel   NotificationChannel
-  locale    String              @default("en") @db.VarChar(8)
+  locale    String              @default("en")
   version   Int                 @default(1)
-  subject   String?             @db.VarChar(200)
-  body      String              @db.VarChar(8000)
+  subject   String?
+  body      String
   isActive  Boolean             @default(true) @map("is_active")
-  updatedById String?           @map("updated_by_id") @db.Uuid
-  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  updatedById String?           @map("updated_by_id")
+  createdAt DateTime            @default(now()) @map("created_at")
+  updatedAt DateTime            @updatedAt @map("updated_at")
 
   @@unique([key, channel, locale, version])
-  @@unique([key, channel, locale], where: raw("is_active"), map: "notification_templates_one_active")
+  @@index([key, channel, locale]) // runtime partial index: notification_templates_one_active
   @@map("notification_templates")
 }
 
@@ -156,17 +156,21 @@ model NotificationTemplate {
 /// business change; a pg-boss worker delivers them. Payload must not contain
 /// clinical details, credentials or full identifiers.
 model Notification {
-  id           String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  userId       String?             @map("user_id") @db.Uuid
+  id           String              @id @map("_id") @default(uuid(7))
+  userId       String?             @map("user_id")
   channel      NotificationChannel
-  templateKey  String              @map("template_key") @db.VarChar(96)
-  recipient    String              @db.VarChar(200)
+  templateKey  String              @map("template_key")
+  recipient    String
   payload      Json                @default("{}")
   status       NotificationStatus  @default(QUEUED)
   attempts     Int                 @default(0)
-  lastError    String?             @map("last_error") @db.VarChar(1000)
-  sentAt       DateTime?           @map("sent_at") @db.Timestamptz(3)
-  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastError    String?             @map("last_error")
+  sentAt       DateTime?           @map("sent_at")
+  title        String?
+  body         String?
+  link         String?
+  readAt       DateTime?           @map("read_at")
+  createdAt    DateTime            @default(now()) @map("created_at")
 
   @@index([status, createdAt])
   @@index([userId, createdAt(sort: Desc)])
@@ -174,32 +178,32 @@ model Notification {
 }
 
 model PlatformSetting {
-  key         String   @id @db.VarChar(96)
+  key         String   @id @map("_id")
   value       Json
-  description String?  @db.VarChar(500)
+  description String?
   isSensitive Boolean  @default(false) @map("is_sensitive")
   version     Int      @default(1)
-  updatedById String?  @map("updated_by_id") @db.Uuid
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  updatedById String?  @map("updated_by_id")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@map("platform_settings")
 }
 
 model ExportJob {
-  id            String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  exportType    String       @map("export_type") @db.VarChar(64)
+  id            String       @id @map("_id") @default(uuid(7))
+  exportType    String       @map("export_type")
   filters       Json         @default("{}")
-  purpose       String       @db.VarChar(500)
+  purpose       String
   status        ExportStatus @default(QUEUED)
-  requestedById String       @map("requested_by_id") @db.Uuid
+  requestedById String       @map("requested_by_id")
   rowCount      Int?         @map("row_count")
-  storageKey    String?      @map("storage_key") @db.VarChar(300)
-  error         String?      @db.VarChar(1000)
+  storageKey    String?      @map("storage_key")
+  error         String?
   downloadCount Int          @default(0) @map("download_count")
-  expiresAt     DateTime?    @map("expires_at") @db.Timestamptz(3)
-  startedAt     DateTime?    @map("started_at") @db.Timestamptz(3)
-  completedAt   DateTime?    @map("completed_at") @db.Timestamptz(3)
-  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt     DateTime?    @map("expires_at")
+  startedAt     DateTime?    @map("started_at")
+  completedAt   DateTime?    @map("completed_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
 
   @@index([requestedById, createdAt(sort: Desc)])
   @@index([status, createdAt])
@@ -210,17 +214,17 @@ model ExportJob {
 /// redacted before insert: no passwords, tokens, clinical content, document
 /// contents or full bank numbers.
 model AuditEvent {
-  id          String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  occurredAt  DateTime     @default(now()) @map("occurred_at") @db.Timestamptz(3)
-  actorUserId String?      @map("actor_user_id") @db.Uuid
-  actorType   String       @default("USER") @map("actor_type") @db.VarChar(16) // USER | SYSTEM | WEBHOOK
-  action      String       @db.VarChar(96)
-  entityType  String       @map("entity_type") @db.VarChar(48)
-  entityId    String?      @map("entity_id") @db.VarChar(64)
+  id          String       @id @map("_id") @default(uuid(7))
+  occurredAt  DateTime     @default(now()) @map("occurred_at")
+  actorUserId String?      @map("actor_user_id")
+  actorType   String       @default("USER") @map("actor_type") // USER | SYSTEM | WEBHOOK
+  action      String
+  entityType  String       @map("entity_type")
+  entityId    String?      @map("entity_id")
   outcome     AuditOutcome @default(SUCCESS)
-  requestId   String?      @map("request_id") @db.VarChar(64)
-  ipAddress   String?      @map("ip_address") @db.VarChar(64)
-  userAgent   String?      @map("user_agent") @db.VarChar(300)
+  requestId   String?      @map("request_id")
+  ipAddress   String?      @map("ip_address")
+  userAgent   String?      @map("user_agent")
   metadata    Json?
 
   @@index([entityType, entityId, occurredAt(sort: Desc)])
@@ -233,14 +237,14 @@ model AuditEvent {
 /// Every read of sensitive material (reports, prescriptions, identity
 /// documents, payout accounts) is logged here, including denied attempts.
 model SensitiveAccessLog {
-  id           String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  actorUserId  String?  @map("actor_user_id") @db.Uuid
-  resourceType String   @map("resource_type") @db.VarChar(48)
-  resourceId   String   @map("resource_id") @db.Uuid
-  purpose      String   @db.VarChar(300)
+  id           String   @id @map("_id") @default(uuid(7))
+  actorUserId  String?  @map("actor_user_id")
+  resourceType String   @map("resource_type")
+  resourceId   String   @map("resource_id")
+  purpose      String
   granted      Boolean
-  requestId    String?  @map("request_id") @db.VarChar(64)
-  accessedAt   DateTime @default(now()) @map("accessed_at") @db.Timestamptz(3)
+  requestId    String?  @map("request_id")
+  accessedAt   DateTime @default(now()) @map("accessed_at")
 
   @@index([resourceType, resourceId, accessedAt(sort: Desc)])
   @@index([actorUserId, accessedAt(sort: Desc)])
@@ -248,18 +252,18 @@ model SensitiveAccessLog {
 }
 
 model ConsentRecord {
-  id                String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  patientProfileId  String       @map("patient_profile_id") @db.Uuid
-  grantedByUserId   String       @map("granted_by_user_id") @db.Uuid
-  granteeProviderId String?      @map("grantee_provider_id") @db.Uuid
+  id                String       @id @map("_id") @default(uuid(7))
+  patientProfileId  String       @map("patient_profile_id")
+  grantedByUserId   String       @map("granted_by_user_id")
+  granteeProviderId String?      @map("grantee_provider_id")
   scope             ConsentScope
-  purpose           String       @db.VarChar(500)
-  policyVersion     String       @map("policy_version") @db.VarChar(32)
-  grantedAt         DateTime     @default(now()) @map("granted_at") @db.Timestamptz(3)
-  expiresAt         DateTime?    @map("expires_at") @db.Timestamptz(3)
-  withdrawnAt       DateTime?    @map("withdrawn_at") @db.Timestamptz(3)
+  purpose           String
+  policyVersion     String       @map("policy_version")
+  grantedAt         DateTime     @default(now()) @map("granted_at")
+  expiresAt         DateTime?    @map("expires_at")
+  withdrawnAt       DateTime?    @map("withdrawn_at")
 
-  patient PatientProfile @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
+  patient PatientProfile @relation(fields: [patientProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([patientProfileId, scope])
   @@index([granteeProviderId])
@@ -267,35 +271,54 @@ model ConsentRecord {
 }
 
 model LegalHold {
-  id          String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  entityType  String    @map("entity_type") @db.VarChar(48)
-  entityId    String    @map("entity_id") @db.Uuid
-  reason      String    @db.VarChar(1000)
-  placedById  String    @map("placed_by_id") @db.Uuid
-  placedAt    DateTime  @default(now()) @map("placed_at") @db.Timestamptz(3)
-  releasedAt  DateTime? @map("released_at") @db.Timestamptz(3)
-  releasedById String?  @map("released_by_id") @db.Uuid
+  id          String    @id @map("_id") @default(uuid(7))
+  entityType  String    @map("entity_type")
+  entityId    String    @map("entity_id")
+  reason      String
+  placedById  String    @map("placed_by_id")
+  placedAt    DateTime  @default(now()) @map("placed_at")
+  releasedAt  DateTime? @map("released_at")
+  releasedById String?  @map("released_by_id")
 
   @@index([entityType, entityId])
   @@map("legal_holds")
 }
 
 model SecurityIncident {
-  id                  String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference           String           @unique @db.VarChar(24)
+  id                  String           @id @map("_id") @default(uuid(7))
+  reference           String           @unique
   severity            IncidentSeverity
   status              IncidentStatus   @default(OPEN)
-  title               String           @db.VarChar(200)
-  summary             String           @db.VarChar(5000)
-  detectedAt          DateTime         @map("detected_at") @db.Timestamptz(3)
-  containedAt         DateTime?        @map("contained_at") @db.Timestamptz(3)
-  resolvedAt          DateTime?        @map("resolved_at") @db.Timestamptz(3)
+  title               String
+  summary             String
+  detectedAt          DateTime         @map("detected_at")
+  containedAt         DateTime?        @map("contained_at")
+  resolvedAt          DateTime?        @map("resolved_at")
   personalDataAffected Boolean         @default(false) @map("personal_data_affected")
-  regulatorNotifiedAt DateTime?        @map("regulator_notified_at") @db.Timestamptz(3)
-  createdById         String           @map("created_by_id") @db.Uuid
-  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  regulatorNotifiedAt DateTime?        @map("regulator_notified_at")
+  createdById         String           @map("created_by_id")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
 
   @@index([status, severity])
   @@map("security_incidents")
+}
+
+/// Web Push (VAPID) subscription for one browser or installed app. Deleted when
+/// the push service says the endpoint is gone (404/410).
+model PushSubscription {
+  id         String    @id @map("_id") @default(uuid(7))
+  userId     String    @map("user_id")
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?   @map("user_agent")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  failedAt   DateTime? @map("failed_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId])
+  @@map("push_subscriptions")
 }

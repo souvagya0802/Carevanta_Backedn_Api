@@ -4,8 +4,8 @@
 
 ```bash
 npm install                    # .npmrc sets legacy-peer-deps (npm 10 peer-resolution bug)
-cp .env.example .env           # fill DATABASE_URL, DIRECT_URL, JWT_SECRET, DATA_ENCRYPTION_KEY
-npm run db:migrate:deploy      # apply committed migrations (uses DIRECT_URL)
+cp .env.example .env           # fill MONGODB_URI, JWT_SECRET, DATA_ENCRYPTION_KEY
+npm run db:sync                # create every collection index (also done automatically at API start)
 npm run db:seed                # idempotent reference data (roles, specialities, templates, settings)
 BOOTSTRAP_ADMIN_EMAIL=you@example.com npm run admin:bootstrap   # prints a one-time set-password token
 npm run dev                    # API on :4000, Swagger at /docs
@@ -14,11 +14,11 @@ npm run dev:worker             # background jobs (optional locally; JOBS_ENABLED
 
 Generate secrets: `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` (JWT) and `randomBytes(32)` (encryption key).
 
-No PostgreSQL install is needed for tests or benchmarks: they start an embedded PostgreSQL 18.
+No MongoDB install is needed for tests: they start an in-memory MongoDB replica set (binary downloaded once to `~/.cache/mongodb-binaries`).
 
 ## Environment variables
 
-See `.env.example` for the full list with comments. Required: `DATABASE_URL`, `JWT_SECRET` (≥ 32 chars), `DATA_ENCRYPTION_KEY` (32 bytes base64). Production additionally requires `CORS_ORIGINS` and `RAZORPAY_WEBHOOK_SECRET`; startup fails fast on an invalid configuration without printing values.
+See `.env.example` for the full list with comments. Required: `MONGODB_URI` (Atlas SRV string or any replica-set URI), `JWT_SECRET` (≥ 32 chars), `DATA_ENCRYPTION_KEY` (32 bytes base64). Production additionally requires `CORS_ORIGINS` and `RAZORPAY_WEBHOOK_SECRET`; startup fails fast on an invalid configuration without printing values.
 
 ## Super-admin bootstrap
 
@@ -27,17 +27,17 @@ See `.env.example` for the full list with comments. Required: `DATABASE_URL`, `J
 ## Deployment
 
 1. Build: `npm ci && npm run build` (produces `dist/`). Run `npm run typecheck && npm run lint && npm test` in CI first.
-2. Migrate **before** starting the new version: `npm run db:migrate:deploy` with `DIRECT_URL`. Rehearse on a Neon branch of production first; check `prisma migrate status`.
+2. Sync indexes **before** starting the new version: `npm run db:sync` (additive; new indexes build online). Rehearse against a cluster restored from an Atlas snapshot first.
 3. Start API instances: `node dist/src/server.js` (set `PORT`, `TRUST_PROXY`). Readiness: `GET /health/ready` (503 while shutting down or DB unreachable); liveness: `GET /health/live`.
 4. Start exactly one worker: `node dist/src/worker.js`.
 5. Roll instances one at a time; SIGTERM drains connections for up to 25 s.
-6. Rollback = redeploy the previous build. Schema changes are backward-compatible by policy (expand/contract), so the previous version runs on the new schema. If a migration must be undone, write a compensating migration; restore a Neon branch/PITR only for data corruption.
+6. Rollback = redeploy the previous build. Schema changes are backward-compatible by policy (expand/contract), so the previous version runs on the new schema. If a schema change must be undone, ship a compensating change; restore a Neon branch/PITR only for data corruption.
 
-Suggested hosts: any Node 22 runtime (Render, Railway, Fly, a VM with systemd/PM2) behind HTTPS; Neon for PostgreSQL. Both API and worker need the same env except the worker prefers `DIRECT_URL`.
+Suggested hosts: any Node 22 runtime (Render, Railway, Fly, a VM with systemd/PM2) behind HTTPS; MongoDB Atlas (a dedicated tier with continuous backup). API and worker share the same env.
 
 ## Connection pooling
 
-API uses the Neon pooled host; `DB_POOL_MAX` (default 10) per instance; keep `instances × DB_POOL_MAX` below the Neon pooler limit for your plan. Migrations, `prisma studio` and the worker use the direct host. Long analytics queries are bounded by `DB_STATEMENT_TIMEOUT_MS` (15 s).
+The MongoDB driver keeps a connection pool per process (default max 100); keep `instances × pool size` under the Atlas connection limit for the tier. `DB_STATEMENT_TIMEOUT_MS` bounds one transaction. Prisma Studio works against the same `MONGODB_URI`.
 
 ## Logging, metrics, alerting
 
@@ -48,11 +48,11 @@ API uses the Neon pooled host; `DB_POOL_MAX` (default 10) per instance; keep `in
 
 ## Backups, restore and disaster recovery
 
-- Neon keeps PITR history per plan; set the retention to ≥ 7 days (30 recommended) and enable scheduled branch snapshots for longer retention.
-- Weekly **restore drill**: create a branch at a timestamp, run `prisma migrate status` and a smoke query (`SELECT count(*) FROM appointments`), then delete the branch. Record the outcome.
+- Atlas Cloud Backup: enable continuous backup (point-in-time restore) with ≥ 7 days retention (30 recommended) plus daily snapshots.
+- Weekly **restore drill**: restore a snapshot into a temporary cluster, run `npm run db:sync` and a smoke query (count of `appointments`), then delete the cluster. Record the outcome.
 - Logical backups for off-platform retention: `pg_dump --format=custom` from the direct host into encrypted object storage; test `pg_restore` quarterly.
 - Document storage must be backed up separately (object storage versioning).
-- RPO/RTO targets for pilot: RPO ≤ 15 min (PITR), RTO ≤ 2 h (restore branch, repoint `DATABASE_URL`, redeploy). Keep a written runbook with the Neon project id and who holds credentials.
+- RPO/RTO targets for pilot: RPO ≤ 15 min (PITR), RTO ≤ 2 h (restore snapshot, repoint `MONGODB_URI`, redeploy). Keep a written runbook with the Atlas project id and who holds credentials.
 
 ## Incident response
 
@@ -90,6 +90,10 @@ Branding (platform name, tagline, logo) is also runtime configuration (`PUT /adm
 ## Reference geography (no hardcoded regions)
 
 Addresses are never typed against a fixed list. `GET /public/geo/countries`, `/states?country=IN` and `/cities?country=IN&state=WB` serve the ISO 3166 dataset bundled with the `country-state-city` package (cached for a day by clients); `GET /public/geo/pincode/:pin` resolves an Indian PIN through the India Post directory (api.postalpincode.in, 6 s timeout, 24 h in-memory cache, 503 when unreachable so the UI falls back to manual entry). The pilot districts (Moyna, Tamluk) exist only as rows in `service_regions`; no default state, district or medical council is baked into code. Going outside India needs a `country` column on locations and regions — the endpoints already take a country code.
+
+## Place search and reverse geocoding
+
+`GET /public/geo/search?q=&lat=&lng=` and `GET /public/geo/reverse?lat=&lng=` proxy a free OpenStreetMap-based geocoder so browsers never call it directly and no key reaches a frontend. `GEOCODER_PROVIDER=nominatim` (default) needs no key but is limited to one request per second (the API serialises calls) and requires `GEOCODER_CONTACT_EMAIL` in the User-Agent per the Nominatim usage policy; `GEOCODER_PROVIDER=locationiq` uses the LocationIQ free tier (5,000 requests/day) with `GEOCODER_API_KEY`. Results are restricted to India, biased to the caller's position, cached in memory for 24 hours and limited to 30 requests per minute per IP; when the upstream fails the API answers 503 "Place search is unavailable right now" and the apps keep working without suggestions. The PIN lookup uses the same geocoder to refine a district-level point to the PIN centre. Keys are never logged.
 
 ## Routine jobs (worker)
 

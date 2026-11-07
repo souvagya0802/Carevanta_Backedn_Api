@@ -1,67 +1,55 @@
-import EmbeddedPostgres from 'embedded-postgres';
-import { execSync } from 'node:child_process';
-import { existsSync, rmSync } from 'node:fs';
-import path from 'node:path';
-import pg from 'pg';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { spawn } from 'node:child_process';
 
 /**
- * Starts a throwaway PostgreSQL 18 (same major version as Neon) on a local
- * port, creates a fresh database, and applies the real migration history with
- * `prisma migrate deploy` — so every test run also verifies that migrations
- * work on an empty database. Tests never touch DATABASE_URL from .env.
+ * Starts a throwaway single-node MongoDB replica set (transactions enabled, same
+ * major line as Atlas), creates every index in an empty database and seeds
+ * reference data once — so every test run also verifies that the indexes apply
+ * cleanly from nothing. Tests never touch MONGODB_URI from .env.
+ *
+ * The mongod binary is downloaded once into ~/.cache/mongodb-binaries.
+ *
+ * Child processes are spawned asynchronously on purpose: a blocking execSync here
+ * stalls this process's event loop, and with it the in-memory server's supervision,
+ * which makes the Prisma engine in the child time out on connect.
  */
-const PORT = Number(process.env.TEST_PG_PORT ?? 54331);
-const DATA_DIR = path.resolve('.tmp/pg-test');
 const DB_NAME = 'carevanta_test';
+let replSet: MongoMemoryReplSet | undefined;
 
-let pgServer: EmbeddedPostgres | undefined;
+function run(command: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { env, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    child.stderr.on('data', (d: Buffer) => { out += d.toString(); });
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`${command} ${args.join(' ')} timed out after ${timeoutMs} ms\n${out.slice(-2000)}`)); }, timeoutMs);
+    child.on('error', (err) => { clearTimeout(timer); reject(err); });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${command} ${args.join(' ')} exited with ${code}\n${out.slice(-4000)}`));
+    });
+  });
+}
 
 export async function setup() {
-  if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true, force: true });
-  pgServer = new EmbeddedPostgres({
-    databaseDir: DATA_DIR,
-    user: 'postgres',
-    password: 'postgres',
-    port: PORT,
-    persistent: true, // we remove the data dir ourselves (Windows file locks)
-    initdbFlags: ['--encoding=UTF8', '--locale=C'],
-    postgresFlags: ['-c', 'max_connections=200', '-c', 'fsync=off', '-c', 'synchronous_commit=off'],
-    onLog: () => {},
-    onError: () => {},
-  });
-  await pgServer.initialise();
-  await pgServer.start();
-  await pgServer.createDatabase(DB_NAME);
+  replSet = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger', dbName: DB_NAME } });
+  const uri = replSet.getUri(DB_NAME);
+  process.env.MONGODB_URI = uri;
+  process.env.MONGODB_DB = DB_NAME;
 
-  const url = `postgresql://postgres:postgres@localhost:${PORT}/${DB_NAME}`;
-  process.env.DATABASE_URL = url;
-  process.env.DIRECT_URL = url;
-
-  execSync('npx prisma migrate deploy', { env: { ...process.env, DATABASE_URL: url, DIRECT_URL: url }, stdio: 'pipe' });
-
-  // Seed reference data once; individual test files reset transactional tables.
-  execSync('npx tsx tests/helpers/seed-once.ts', {
-    env: {
-      ...process.env,
-      APP_ENV: 'test',
-      DATABASE_URL: url,
-      JWT_SECRET: 'test-only-jwt-secret-not-for-any-real-environment-0123456789',
-      DATA_ENCRYPTION_KEY: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-    },
-    stdio: 'pipe',
-  });
-
-  // Sanity check the database is reachable.
-  const c = new pg.Client({ connectionString: url });
-  await c.connect();
-  await c.end();
+  const env = {
+    ...process.env,
+    APP_ENV: 'test',
+    MONGODB_URI: uri,
+    MONGODB_DB: DB_NAME,
+    JWT_SECRET: 'test-only-jwt-secret-not-for-any-real-environment-0123456789',
+    DATA_ENCRYPTION_KEY: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+  };
+  // Every index (schema manifest + partial indexes), then reference data (run twice inside: proves the seed is idempotent).
+  await run('npx', ['tsx', 'tests/helpers/seed-once.ts'], env, 240_000);
 }
 
 export async function teardown() {
-  await pgServer?.stop();
-  try {
-    if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
-  } catch {
-    // Windows may hold the directory briefly after shutdown; setup() wipes it next run.
-  }
+  await replSet?.stop({ doCleanup: true, force: true });
 }

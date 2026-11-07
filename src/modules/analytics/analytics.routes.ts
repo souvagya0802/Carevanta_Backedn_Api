@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute } from '../../http/route.js';
-import { prisma, Prisma } from '../../lib/prisma.js';
+import { prisma } from '../../lib/prisma.js';
+import { aggregate, dateTrunc, ejsonDate, istDayStart } from '../../lib/mongo.js';
+import type { Granularity } from '../../lib/mongo.js';
 import { badRequest } from '../../lib/errors.js';
 import { DateTimeString } from '../../http/dto.js';
 import { env } from '../../config/env.js';
@@ -10,6 +12,10 @@ import { env } from '../../config/env.js';
  * Dashboard metrics. Every number is an aggregate query over real rows — there
  * is no synthetic fallback. `dataSource` tells the UI which environment the
  * figures come from so demo data can be labelled.
+ *
+ * Counters that Prisma's typed API can express use it; everything that needs a
+ * join, a date bucket or a grouped sum runs as a MongoDB aggregation pipeline
+ * through `aggregate()`. Pipelines use the stored snake_case field names.
  */
 const n = (v: bigint | number | null | undefined) => Number(v ?? 0);
 
@@ -40,9 +46,35 @@ const Range = z
     return { from, to };
   });
 
-async function groupCount<K extends string>(sql: Prisma.Sql): Promise<Record<K, number>> {
-  const rows = await prisma.$queryRaw<{ k: K; c: bigint }[]>(sql);
-  return Object.fromEntries(rows.map((r) => [r.k, n(r.c)])) as Record<K, number>;
+type Match = Record<string, unknown>;
+type Stage = Record<string, unknown>;
+
+/** `field >= from AND field < to` as a `$match` fragment. */
+const between = (field: string, from: Date, to: Date): Match => ({ [field]: { $gte: ejsonDate(from), $lt: ejsonDate(to) } });
+
+/** `SELECT field, count(*) FROM collection WHERE match GROUP BY field` → `{ [field value]: count }`. */
+async function countBy<K extends string>(collection: string, field: string, match: Match = {}): Promise<Record<K, number>> {
+  const rows = await aggregate<{ _id: K; c: bigint | number }>(prisma, collection, [
+    ...(Object.keys(match).length ? [{ $match: match }] : []),
+    { $group: { _id: `$${field}`, c: { $sum: 1 } } },
+  ]);
+  return Object.fromEntries(rows.map((r) => [String(r._id), n(r.c)])) as Record<K, number>;
+}
+
+type SeriesRow = { bucket: Date; group: string | null; value: bigint | number };
+
+/**
+ * `SELECT date_trunc(g, dateField) AS bucket, groupField AS "group", <value> ... GROUP BY 1,2 ORDER BY 1`.
+ * `valueExpr` defaults to `count(*)`; pass a `$sum` operand for grouped sums.
+ */
+function series(collection: string, dateField: string, g: Granularity, match: Match, groupField: string | null, valueExpr: unknown = 1): Promise<SeriesRow[]> {
+  const stages: Stage[] = [
+    { $match: match },
+    { $group: { _id: { bucket: dateTrunc(`$${dateField}`, g), ...(groupField ? { group: `$${groupField}` } : {}) }, value: { $sum: valueExpr } } },
+    { $sort: { '_id.bucket': 1, '_id.group': 1 } },
+    { $project: { _id: 0, bucket: '$_id.bucket', group: { $ifNull: ['$_id.group', null] }, value: 1 } },
+  ];
+  return aggregate<SeriesRow>(prisma, collection, stages);
 }
 
 export function analyticsRouter(): Router {
@@ -59,35 +91,100 @@ export function analyticsRouter(): Router {
     query: Range,
     handler: ({ query }) => cached(`overview:${minuteKey(query.from)}:${minuteKey(query.to)}`, async () => {
       const { from, to } = query;
+      const now = new Date();
+      const todayStart = istDayStart(now);
+      const todayEnd = new Date(todayStart.getTime() + 86_400_000);
       const [users, providersByType, providersByStatus, pendingCases, apptPeriod, apptToday, dxPeriod, rxPeriod, dispatchActive, finance, refunds, failedPayments, payables, settlements, support] = await Promise.all([
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM users GROUP BY 1`),
-        groupCount<string>(Prisma.sql`SELECT type AS k, count(*)::bigint AS c FROM providers WHERE status = 'APPROVED' GROUP BY 1`),
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM providers GROUP BY 1`),
+        countBy<string>('users', 'status'),
+        countBy<string>('providers', 'type', { status: 'APPROVED' }),
+        countBy<string>('providers', 'status'),
         prisma.verificationCase.count({ where: { status: { in: ['OPEN', 'IN_REVIEW', 'AWAITING_PROVIDER'] } } }),
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM appointments WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1`),
-        prisma.$queryRaw<{ c: bigint }[]>`SELECT count(*)::bigint AS c FROM appointments a JOIN appointment_slots s ON s.id = a.slot_id WHERE s.starts_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata' AND s.starts_at < (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') + interval '1 day') AT TIME ZONE 'Asia/Kolkata' AND a.status IN ('REQUESTED','CONFIRMED','CHECKED_IN','COMPLETED')`,
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM diagnostic_orders WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1`),
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM pharmacy_orders WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1`),
+        countBy<string>('appointments', 'status', between('created_at', from, to)),
+        // Appointments whose slot starts during the current IST calendar day and are still live or completed.
+        aggregate<{ c: number }>(prisma, 'appointment_slots', [
+          { $match: between('starts_at', todayStart, todayEnd) },
+          { $lookup: { from: 'appointments', localField: '_id', foreignField: 'slot_id', as: 'a' } },
+          { $unwind: '$a' },
+          { $match: { 'a.status': { $in: ['REQUESTED', 'CONFIRMED', 'CHECKED_IN', 'COMPLETED'] } } },
+          { $count: 'c' },
+        ]),
+        countBy<string>('diagnostic_orders', 'status', between('created_at', from, to)),
+        countBy<string>('pharmacy_orders', 'status', between('created_at', from, to)),
         prisma.dispatchRequest.count({ where: { mode: 'LIVE', status: { notIn: ['COMPLETED', 'CANCELLED'] } } }),
-        prisma.$queryRaw<{ gtv: bigint | null; commission: bigint | null; tax: bigint | null; txns: bigint }[]>`
-          SELECT COALESCE(SUM(t.gross_minor - t.refunded_minor), 0)::bigint AS gtv,
-                 COALESCE(SUM(c.commission_minor), 0)::bigint AS commission,
-                 COALESCE(SUM(c.tax_minor), 0)::bigint AS tax,
-                 count(DISTINCT t.id)::bigint AS txns
-            FROM service_transactions t
-            LEFT JOIN commission_snapshots c ON c.transaction_id = t.id AND c.status = 'FINAL'
-           WHERE t.service_completed_at >= ${from} AND t.service_completed_at < ${to}`,
-        prisma.$queryRaw<{ amount: bigint | null; c: bigint }[]>`SELECT COALESCE(SUM(amount_minor),0)::bigint AS amount, count(*)::bigint AS c FROM refunds WHERE status = 'SUCCEEDED' AND processed_at >= ${from} AND processed_at < ${to}`,
+        // GTV net of refunds plus the FINAL commission snapshot (at most one per transaction, enforced by a partial unique index).
+        aggregate<{ gtv: bigint | number; commission: bigint | number; tax: bigint | number; txns: bigint | number }>(prisma, 'service_transactions', [
+          { $match: between('service_completed_at', from, to) },
+          { $lookup: { from: 'commission_snapshots', localField: '_id', foreignField: 'transaction_id', as: 'snaps' } },
+          {
+            $project: {
+              net: { $subtract: ['$gross_minor', '$refunded_minor'] },
+              final: { $filter: { input: '$snaps', as: 's', cond: { $eq: ['$$s.status', 'FINAL'] } } },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              gtv: { $sum: '$net' },
+              commission: { $sum: { $sum: '$final.commission_minor' } },
+              tax: { $sum: { $sum: '$final.tax_minor' } },
+              txns: { $sum: 1 },
+            },
+          },
+        ]),
+        aggregate<{ amount: bigint | number; c: bigint | number }>(prisma, 'refunds', [
+          { $match: { status: 'SUCCEEDED', ...between('processed_at', from, to) } },
+          { $group: { _id: null, amount: { $sum: '$amount_minor' }, c: { $sum: 1 } } },
+        ]),
         prisma.payment.count({ where: { status: 'FAILED', createdAt: { gte: from, lt: to } } }),
-        prisma.$queryRaw<{ amount: bigint | null; providers: bigint }[]>`SELECT COALESCE(SUM(amount_minor),0)::bigint AS amount, count(DISTINCT provider_id)::bigint AS providers FROM provider_ledger_entries WHERE settlement_item_id IS NULL`,
-        groupCount<string>(Prisma.sql`SELECT status AS k, count(*)::bigint AS c FROM settlement_batches GROUP BY 1`),
-        prisma.$queryRaw<{ open: bigint; breached: bigint; avg_hours: number | null }[]>`
-          SELECT count(*) FILTER (WHERE status NOT IN ('RESOLVED','CLOSED'))::bigint AS open,
-                 count(*) FILTER (WHERE status NOT IN ('RESOLVED','CLOSED') AND sla_due_at < now())::bigint AS breached,
-                 AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 3600) FILTER (WHERE resolved_at >= ${from} AND resolved_at < ${to}) AS avg_hours
-            FROM support_cases`,
+        // Unsettled ledger balance and the number of distinct providers holding one.
+        aggregate<{ amount: bigint | number; providers: bigint | number }>(prisma, 'provider_ledger_entries', [
+          { $match: { settlement_item_id: null } },
+          { $group: { _id: '$provider_id', amount: { $sum: '$amount_minor' } } },
+          { $group: { _id: null, amount: { $sum: '$amount' }, providers: { $sum: 1 } } },
+        ]),
+        countBy<string>('settlement_batches', 'status'),
+        aggregate<{ open: bigint | number; breached: bigint | number; avg_hours: number | null }>(prisma, 'support_cases', [
+          {
+            $group: {
+              _id: null,
+              open: { $sum: { $cond: [{ $not: [{ $in: ['$status', ['RESOLVED', 'CLOSED']] }] }, 1, 0] } },
+              breached: {
+                $sum: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $not: [{ $in: ['$status', ['RESOLVED', 'CLOSED']] }] },
+                        { $eq: [{ $type: '$sla_due_at' }, 'date'] },
+                        { $lt: ['$sla_due_at', ejsonDate(now)] },
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
+                },
+              },
+              // AVG(...) FILTER (WHERE resolved_at in range): $avg skips nulls, so out-of-range rows contribute nothing.
+              avg_hours: {
+                $avg: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $eq: [{ $type: '$resolved_at' }, 'date'] },
+                        { $gte: ['$resolved_at', ejsonDate(from)] },
+                        { $lt: ['$resolved_at', ejsonDate(to)] },
+                      ],
+                    },
+                    { $divide: [{ $subtract: ['$resolved_at', '$created_at'] }, 3_600_000] },
+                    null,
+                  ],
+                },
+              },
+            },
+          },
+        ]),
       ]);
-      const fin = finance[0]!;
+      // A `$group` over zero input documents yields no row (unlike SQL aggregates), so default every scalar.
+      const fin = finance[0] ?? { gtv: 0, commission: 0, tax: 0, txns: 0 };
       const completed = n(apptPeriod['COMPLETED']);
       const cancelled = n(apptPeriod['CANCELLED_BY_PATIENT']) + n(apptPeriod['CANCELLED_BY_PROVIDER']) + n(apptPeriod['CANCELLED_BY_PLATFORM']);
       const noShow = n(apptPeriod['NO_SHOW']);
@@ -138,39 +235,38 @@ export function analyticsRouter(): Router {
     handler: ({ query }) => cached(`series:${query.metric}:${query.granularity}:${query.from ?? ''}:${query.to ?? ''}`, async () => {
       const { from, to } = Range.parse({ from: query.from, to: query.to });
       const g = query.granularity;
-      type Row = { bucket: Date; group: string | null; value: bigint | number };
-      let rows: Row[];
+      let rows: SeriesRow[];
       let unit = 'count';
       switch (query.metric) {
         case 'registrations':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, NULL AS "group", count(*)::bigint AS value FROM users WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1 ORDER BY 1`;
+          rows = await series('users', 'created_at', g, between('created_at', from, to), null);
           break;
         case 'appointments':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, status::text AS "group", count(*)::bigint AS value FROM appointments WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('appointments', 'created_at', g, between('created_at', from, to), 'status');
           break;
         case 'diagnostic_orders':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, status::text AS "group", count(*)::bigint AS value FROM diagnostic_orders WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('diagnostic_orders', 'created_at', g, between('created_at', from, to), 'status');
           break;
         case 'pharmacy_orders':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, status::text AS "group", count(*)::bigint AS value FROM pharmacy_orders WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('pharmacy_orders', 'created_at', g, between('created_at', from, to), 'status');
           break;
         case 'gtv':
           unit = 'INR_minor';
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, service_completed_at) AS bucket, category::text AS "group", COALESCE(SUM(gross_minor - refunded_minor),0)::bigint AS value FROM service_transactions WHERE service_completed_at >= ${from} AND service_completed_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('service_transactions', 'service_completed_at', g, between('service_completed_at', from, to), 'category', { $subtract: ['$gross_minor', '$refunded_minor'] });
           break;
         case 'commission':
           unit = 'INR_minor';
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, calculated_at) AS bucket, NULL AS "group", COALESCE(SUM(commission_minor),0)::bigint AS value FROM commission_snapshots WHERE status = 'FINAL' AND calculated_at >= ${from} AND calculated_at < ${to} GROUP BY 1 ORDER BY 1`;
+          rows = await series('commission_snapshots', 'calculated_at', g, { status: 'FINAL', ...between('calculated_at', from, to) }, null, '$commission_minor');
           break;
         case 'refunds':
           unit = 'INR_minor';
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, processed_at) AS bucket, NULL AS "group", COALESCE(SUM(amount_minor),0)::bigint AS value FROM refunds WHERE status = 'SUCCEEDED' AND processed_at >= ${from} AND processed_at < ${to} GROUP BY 1 ORDER BY 1`;
+          rows = await series('refunds', 'processed_at', g, { status: 'SUCCEEDED', ...between('processed_at', from, to) }, null, '$amount_minor');
           break;
         case 'complaints':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, type::text AS "group", count(*)::bigint AS value FROM support_cases WHERE created_at >= ${from} AND created_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('support_cases', 'created_at', g, between('created_at', from, to), 'type');
           break;
         case 'provider_applications':
-          rows = await prisma.$queryRaw<Row[]>`SELECT date_trunc(${g}, created_at) AS bucket, to_status::text AS "group", count(*)::bigint AS value FROM provider_status_history WHERE to_status IN ('SUBMITTED','APPROVED','REJECTED') AND created_at >= ${from} AND created_at < ${to} GROUP BY 1,2 ORDER BY 1`;
+          rows = await series('provider_status_history', 'created_at', g, { to_status: { $in: ['SUBMITTED', 'APPROVED', 'REJECTED'] }, ...between('created_at', from, to) }, 'to_status');
           break;
       }
       return { metric: query.metric, granularity: g, unit, points: rows.map((x) => ({ bucket: x.bucket.toISOString(), group: x.group, value: n(x.value) })) };
@@ -185,13 +281,25 @@ export function analyticsRouter(): Router {
     permissions: ['analytics.read'],
     query: Range,
     handler: async ({ query }) => {
-      const providers = await prisma.$queryRaw<{ district: string; type: string; c: bigint }[]>`
-        SELECT l.district, p.type::text AS type, count(DISTINCT p.id)::bigint AS c
-          FROM providers p JOIN provider_locations l ON l.provider_id = p.id AND l.is_active
-         WHERE p.status = 'APPROVED' GROUP BY 1,2 ORDER BY 1,2`;
-      const bookings = await prisma.$queryRaw<{ district: string; c: bigint }[]>`
-        SELECT l.district, count(*)::bigint AS c FROM appointments a JOIN provider_locations l ON l.id = a.location_id
-         WHERE a.created_at >= ${query.from} AND a.created_at < ${query.to} GROUP BY 1 ORDER BY 2 DESC`;
+      // Distinct approved providers per (district, type), counted once even when a provider has several active locations in a district.
+      const providers = await aggregate<{ district: string; type: string; c: bigint | number }>(prisma, 'provider_locations', [
+        { $match: { is_active: true } },
+        { $lookup: { from: 'providers', localField: 'provider_id', foreignField: '_id', as: 'p' } },
+        { $unwind: '$p' },
+        { $match: { 'p.status': 'APPROVED' } },
+        { $group: { _id: { district: '$district', type: '$p.type', provider: '$p._id' } } },
+        { $group: { _id: { district: '$_id.district', type: '$_id.type' }, c: { $sum: 1 } } },
+        { $sort: { '_id.district': 1, '_id.type': 1 } },
+        { $project: { _id: 0, district: '$_id.district', type: '$_id.type', c: 1 } },
+      ]);
+      const bookings = await aggregate<{ district: string; c: bigint | number }>(prisma, 'appointments', [
+        { $match: between('created_at', query.from, query.to) },
+        { $lookup: { from: 'provider_locations', localField: 'location_id', foreignField: '_id', as: 'l' } },
+        { $unwind: '$l' },
+        { $group: { _id: '$l.district', c: { $sum: 1 } } },
+        { $sort: { c: -1, _id: 1 } },
+        { $project: { _id: 0, district: '$_id', c: 1 } },
+      ]);
       const regions = await prisma.serviceRegion.findMany({ select: { code: true, name: true, district: true, status: true } });
       return {
         dataSource: env.APP_ENV,
@@ -210,14 +318,29 @@ export function analyticsRouter(): Router {
     permissions: ['analytics.read'],
     query: Range,
     handler: async ({ query }) => {
-      const specialities = await prisma.$queryRaw<{ name: string; c: bigint }[]>`
-        SELECT s.name, count(*)::bigint AS c
-          FROM appointments a JOIN doctor_specialities ds ON ds.doctor_provider_id = a.doctor_provider_id AND ds.is_primary
-          JOIN specialities s ON s.id = ds.speciality_id
-         WHERE a.created_at >= ${query.from} AND a.created_at < ${query.to} GROUP BY 1 ORDER BY 2 DESC LIMIT 20`;
-      const tests = await prisma.$queryRaw<{ name: string; c: bigint }[]>`
-        SELECT i.service_name AS name, count(*)::bigint AS c FROM diagnostic_order_items i JOIN diagnostic_orders o ON o.id = i.order_id
-         WHERE o.created_at >= ${query.from} AND o.created_at < ${query.to} GROUP BY 1 ORDER BY 2 DESC LIMIT 20`;
+      // Appointments in range joined to the doctor's primary speciality.
+      const specialities = await aggregate<{ name: string; c: bigint | number }>(prisma, 'appointments', [
+        { $match: between('created_at', query.from, query.to) },
+        { $lookup: { from: 'doctor_specialities', localField: 'doctor_provider_id', foreignField: 'doctor_provider_id', as: 'ds' } },
+        { $unwind: '$ds' },
+        { $match: { 'ds.is_primary': true } },
+        { $lookup: { from: 'specialities', localField: 'ds.speciality_id', foreignField: '_id', as: 's' } },
+        { $unwind: '$s' },
+        { $group: { _id: '$s.name', c: { $sum: 1 } } },
+        { $sort: { c: -1, _id: 1 } },
+        { $limit: 20 },
+        { $project: { _id: 0, name: '$_id', c: 1 } },
+      ]);
+      // Line items of diagnostic orders placed in range, by service name snapshot.
+      const tests = await aggregate<{ name: string; c: bigint | number }>(prisma, 'diagnostic_orders', [
+        { $match: between('created_at', query.from, query.to) },
+        { $lookup: { from: 'diagnostic_order_items', localField: '_id', foreignField: 'order_id', as: 'i' } },
+        { $unwind: '$i' },
+        { $group: { _id: '$i.service_name', c: { $sum: 1 } } },
+        { $sort: { c: -1, _id: 1 } },
+        { $limit: 20 },
+        { $project: { _id: 0, name: '$_id', c: 1 } },
+      ]);
       return { dataSource: env.APP_ENV, specialities: specialities.map((x) => ({ name: x.name, count: n(x.c) })), tests: tests.map((x) => ({ name: x.name, count: n(x.c) })) };
     },
   });

@@ -5,7 +5,12 @@ import { prisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, isPgError, notFound, separationOfDuties } from '../../lib/errors.js';
 import { buildPage, cursorOrderBy, cursorWhere, PaginationQuery } from '../../lib/pagination.js';
-import { MoneyInput, SearchText, minor } from '../../http/dto.js';
+import { MoneyInput, SearchText } from '../../http/dto.js';
+import { listOfferings, upsertOffering } from '../providers/provider-admin.service.js';
+import { clearSearchVocabulary } from '../discovery/smart-search.js';
+
+/** Everyday words patients type for a speciality or test. Lowercase, de-duplicated. */
+const Synonyms = z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).transform((xs) => [...new Set(xs)]);
 
 const Code = z.string().regex(/^[A-Z][A-Z0-9_]{1,63}$/, 'UPPER_SNAKE_CASE code');
 const ServiceCategoryEnum = z.enum(['CONSULTATION', 'DIAGNOSTIC_TEST', 'IMAGING', 'PROCEDURE', 'SURGERY', 'PHARMACY', 'AMBULANCE', 'HOME_CARE', 'OTHER']);
@@ -28,11 +33,17 @@ export function catalogueRouter(): Router {
   const base = '/admin/catalogue';
   const tags = ['Admin · Catalogue'];
 
+  // Patient search keeps a short-lived copy of the catalogue vocabulary; any successful edit here refreshes it at once.
+  r.use(base, (req, res, next) => {
+    if (req.method !== 'GET') res.on('finish', () => { if (res.statusCode < 400) clearSearchVocabulary(); });
+    next();
+  });
+
   // ── Specialities ───────────────────────────────────────────────────────
-  const SpecialityDto = z.object({ id: z.uuid(), code: z.string(), name: z.string(), parentCode: z.string().nullable(), description: z.string().nullable(), isActive: z.boolean(), doctorCount: z.number().int() });
+  const SpecialityDto = z.object({ id: z.uuid(), code: z.string(), name: z.string(), parentCode: z.string().nullable(), description: z.string().nullable(), synonyms: z.array(z.string()), isActive: z.boolean(), doctorCount: z.number().int() });
   const loadSpecialities = async () => {
     const rows = await prisma.speciality.findMany({ orderBy: { name: 'asc' }, include: { parent: { select: { code: true } }, _count: { select: { doctors: true } } } });
-    return rows.map((s) => ({ id: s.id, code: s.code, name: s.name, parentCode: s.parent?.code ?? null, description: s.description, isActive: s.isActive, doctorCount: s._count.doctors }));
+    return rows.map((s) => ({ id: s.id, code: s.code, name: s.name, parentCode: s.parent?.code ?? null, description: s.description, synonyms: s.synonyms, isActive: s.isActive, doctorCount: s._count.doctors }));
   };
 
   defineRoute(r, base, {
@@ -51,7 +62,7 @@ export function catalogueRouter(): Router {
     summary: 'Create a speciality or sub-speciality',
     tags,
     permissions: ['catalogue.manage'],
-    body: z.object({ code: Code, name: z.string().trim().min(2).max(120), parentCode: Code.optional(), description: z.string().max(1000).optional() }),
+    body: z.object({ code: Code, name: z.string().trim().min(2).max(120), parentCode: Code.optional(), description: z.string().max(1000).optional(), synonyms: Synonyms.default([]) }),
     response: SpecialityDto,
     handler: async ({ body }) => {
       const parent = body.parentCode ? await prisma.speciality.findUnique({ where: { code: body.parentCode } }) : null;
@@ -59,7 +70,7 @@ export function catalogueRouter(): Router {
       const s = await uniqueGuard(
         () =>
           prisma.$transaction(async (tx) => {
-            const created = await tx.speciality.create({ data: { code: body.code, name: body.name, description: body.description, parentId: parent?.id } });
+            const created = await tx.speciality.create({ data: { code: body.code, name: body.name, description: body.description, synonyms: body.synonyms, parentId: parent?.id } });
             await audit(tx, { action: 'catalogue.speciality_created', entityType: 'speciality', entityId: created.id, metadata: { code: body.code } });
             return created;
           }),
@@ -76,7 +87,7 @@ export function catalogueRouter(): Router {
     tags,
     permissions: ['catalogue.manage'],
     params: IdParams,
-    body: z.object({ name: z.string().trim().min(2).max(120).optional(), description: z.string().max(1000).nullable().optional(), isActive: z.boolean().optional() }).strict(),
+    body: z.object({ name: z.string().trim().min(2).max(120).optional(), description: z.string().max(1000).nullable().optional(), synonyms: Synonyms.optional(), isActive: z.boolean().optional() }).strict(),
     response: SpecialityDto,
     handler: async ({ params, body }) => {
       await uniqueGuard(
@@ -147,7 +158,7 @@ export function catalogueRouter(): Router {
     body: z.object({
       name: z.string().trim().min(2).max(160),
       kind: z.enum(['CONDITION', 'SYMPTOM']).default('CONDITION'),
-      synonyms: z.array(z.string().trim().toLowerCase().min(2).max(120)).max(30).default([]),
+      synonyms: z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).default([]),
       isRedFlag: z.boolean().default(false),
     }),
     response: ConditionDto,
@@ -174,7 +185,7 @@ export function catalogueRouter(): Router {
     params: IdParams,
     body: z
       .object({
-        synonyms: z.array(z.string().trim().toLowerCase().min(2).max(120)).max(30).optional(),
+        synonyms: z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).optional(),
         isRedFlag: z.boolean().optional(),
         isActive: z.boolean().optional(),
       })
@@ -370,6 +381,7 @@ export function catalogueRouter(): Router {
     sampleType: z.string().nullable(),
     fastingRequired: z.boolean().nullable(),
     preparationInstructions: z.string().nullable(),
+    synonyms: z.array(z.string()),
     isActive: z.boolean(),
     createdAt: z.string(),
   });
@@ -383,6 +395,7 @@ export function catalogueRouter(): Router {
     sampleType: s.sampleType,
     fastingRequired: s.fastingRequired,
     preparationInstructions: s.preparationInstructions,
+    synonyms: s.synonyms ?? [],
     isActive: s.isActive,
     createdAt: s.createdAt.toISOString(),
   });
@@ -400,7 +413,7 @@ export function catalogueRouter(): Router {
       const rows = await prisma.service.findMany({
         where: {
           ...(query.category ? { category: query.category } : {}),
-          ...(query.q ? { name: { contains: query.q, mode: 'insensitive' } } : {}),
+          ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { synonyms: { has: query.q.toLowerCase() } }] } : {}),
           ...cursorWhere(query.cursor),
         },
         include: { speciality: { select: { code: true } } },
@@ -422,6 +435,7 @@ export function catalogueRouter(): Router {
     sampleType: z.string().max(64).optional(),
     fastingRequired: z.boolean().optional(),
     preparationInstructions: z.string().max(2000).optional(),
+    synonyms: Synonyms.default([]),
   });
 
   defineRoute(r, base, {
@@ -455,7 +469,7 @@ export function catalogueRouter(): Router {
     tags,
     permissions: ['catalogue.manage'],
     params: IdParams,
-    body: ServiceInput.omit({ code: true, category: true, specialityCode: true }).partial().extend({ isActive: z.boolean().optional() }).strict(),
+    body: ServiceInput.omit({ code: true, category: true, specialityCode: true, synonyms: true }).partial().extend({ synonyms: Synonyms.optional(), isActive: z.boolean().optional() }).strict(),
     response: ServiceDto,
     handler: async ({ params, body }) =>
       prisma.$transaction(async (tx) => {
@@ -488,19 +502,7 @@ export function catalogueRouter(): Router {
     permissions: ['providers.read'],
     params: IdParams,
     response: z.array(OfferingDto),
-    handler: async ({ params }) =>
-      (await prisma.providerService.findMany({ where: { providerId: params.id }, include: { service: true }, orderBy: { createdAt: 'asc' } })).map((o) => ({
-        id: o.id,
-        serviceCode: o.service.code,
-        serviceName: o.service.name,
-        category: o.service.category,
-        locationId: o.locationId,
-        priceMinor: minor(o.priceMinor)!,
-        currency: o.currency,
-        homeServiceAvailable: o.homeServiceAvailable,
-        turnaroundHours: o.turnaroundHours,
-        isActive: o.isActive,
-      })),
+    handler: ({ params }) => listOfferings(params.id),
   });
 
   defineRoute(r, '/admin/providers', {
@@ -519,23 +521,7 @@ export function catalogueRouter(): Router {
       isActive: z.boolean().default(true),
     }),
     response: z.object({ id: z.uuid() }),
-    handler: async ({ params, body, auth }) =>
-      prisma.$transaction(async (tx) => {
-        const service = await tx.service.findUnique({ where: { code: params.serviceCode } });
-        if (!service || !service.isActive) throw badRequest('Unknown or inactive service');
-        const provider = await tx.provider.findUnique({ where: { id: params.id } });
-        if (!provider) throw notFound('Provider');
-        if (body.locationId && !(await tx.providerLocation.findFirst({ where: { id: body.locationId, providerId: params.id } }))) {
-          throw badRequest('Location does not belong to this provider');
-        }
-        const existing = await tx.providerService.findFirst({ where: { providerId: params.id, serviceId: service.id, locationId: body.locationId } });
-        const data = { priceMinor: BigInt(body.priceMinor), homeServiceAvailable: body.homeServiceAvailable, turnaroundHours: body.turnaroundHours ?? null, isActive: body.isActive };
-        const o = existing
-          ? await tx.providerService.update({ where: { id: existing.id }, data })
-          : await tx.providerService.create({ data: { providerId: params.id, serviceId: service.id, locationId: body.locationId, ...data } });
-        await audit(tx, { action: 'provider.offering_saved', entityType: 'provider', entityId: params.id, actorUserId: auth.userId, metadata: { serviceCode: params.serviceCode, priceMinor: body.priceMinor } });
-        return { id: o.id };
-      }),
+    handler: ({ params, body, auth }) => upsertOffering(auth, params.id, params.serviceCode, body),
   });
 
   // ── Medicines ──────────────────────────────────────────────────────────

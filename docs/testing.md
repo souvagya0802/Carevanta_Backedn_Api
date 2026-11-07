@@ -2,7 +2,7 @@
 
 ## Approach
 
-- **Real database in every test.** `tests/global-setup.ts` starts an embedded PostgreSQL 18 (same major as Neon) on port 54331, creates an empty database, applies the committed migrations with `prisma migrate deploy`, runs the reference seed twice (proving idempotency), and tears everything down. Tests refuse to run unless `DATABASE_URL` points at that local database, so they can never touch Neon.
+- **Real database in every test.** `tests/global-setup.ts` starts an in-memory MongoDB replica set (mongodb-memory-server), pushes the Prisma schema into an empty database, creates the partial indexes and seeds reference data twice (proving idempotency). Tests never touch `MONGODB_URI` from `.env`; `tests/setup-env.ts` refuses anything but the local test URI.
 - **Integration tests through HTTP** (Supertest) exercise validation, auth, permissions, transactions, constraints and audit together — the way clients will use the API. Unit tests cover pure logic (money, commission maths, redaction, encryption, state machines, cursors, IST time, upload validation).
 - **Concurrency is tested for real**: parallel bookings on one slot, parallel refresh-token use, parallel affiliation invites, parallel login failures, parallel settlement batch creation.
 - **Synthetic data only**: fake names, `*.test.carevanta.local` emails, `98000xxxxx` numbers, `%PDF-` stub files.
@@ -29,11 +29,10 @@ tests/integration/maintenance.test.ts     credential expiry, renewal reminders, 
 |---|---|
 | `npm run typecheck` | pass (TypeScript 6.0, strict) |
 | `npm run lint` | pass (0 problems) |
-| `npm test` | **11 files, 113 tests passed** (99–164 s depending on machine load; includes migration from empty DB + seed) |
+| `npm test` | **28 files, 198 tests passed** on 2026-11-07 after the MongoDB migration (211 s on a laptop; includes index creation into an empty in-memory replica set + seed) |
 | `npm run build` | pass; `dist/` imports cleanly |
 | `npm run openapi:generate` | 198 paths, 238 operations |
-| `prisma migrate deploy` on Neon | 4 migrations applied, status up to date |
-| `prisma migrate diff` (DB vs schema) after deploy | empty migration (no drift) |
+| `npm run db:sync` on Atlas | collections and indexes created; rerun is a no-op |
 
 ## Coverage of the brief's required scenarios
 
@@ -43,7 +42,7 @@ tests/integration/maintenance.test.ts     credential expiry, renewal reminders, 
 | Providers | valid registration, missing fields, duplicates, invalid credentials data, all states, unauthorised approval, multi-facility doctor, duplicate/concurrent affiliations, invalid transitions | government API integration (none exists) |
 | Bookings | success, invalid slot, provider unavailable, double booking, concurrent same slot, invalid transitions, repeated cancel, idempotent retries, rejection (reason required), reschedule conflicts, attribution/eligibility | provider-initiated rejection flow end-to-end in portal (covered via admin) |
 | Finance | commission calc, effective-date change, refund calc, duplicate webhook, invalid signature, failure, mismatch, settlement retry, duplicate settlement prevention, rounding edge cases (exhaustive sweep) | live Razorpay sandbox (simulated gateway used) |
-| Database & performance | migration from empty DB, seed reruns, referential integrity, unique constraints, cursor pagination, search, concurrent writes | query-plan assertions are in the benchmark script, not unit tests; connection-failure recovery tested manually only |
+| Database & performance | schema push into an empty DB, seed reruns, referential integrity, unique constraints, cursor pagination, search, concurrent writes | query-plan assertions are in the benchmark script, not unit tests; connection-failure recovery tested manually only |
 | Admin UI | — | see the dashboard repository's test suite |
 
 ## Running
@@ -55,4 +54,4 @@ npm run test:integration
 npx vitest run tests/integration/finance.test.ts   # one file
 ```
 
-The first run downloads the PostgreSQL binaries (~30 MB) via `embedded-postgres`. On Windows the data directory is `.tmp/pg-test` and is recreated each run.
+The first run downloads the MongoDB binary (~600 MB on Windows) into `~/.cache/mongodb-binaries`; later runs start in a few seconds. Data lives in a temporary directory removed at teardown.

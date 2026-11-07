@@ -15,6 +15,11 @@ import { apiRouter } from './routes.js';
 import { webhookRouter } from './modules/finance/webhooks.routes.js';
 
 let shuttingDown = false;
+// Readiness also waits for the MongoDB index sync that runs after the server starts listening (see server.ts).
+let indexesReady = false;
+export function markIndexesReady() {
+  indexesReady = true;
+}
 export function markShuttingDown() {
   shuttingDown = true;
 }
@@ -85,8 +90,12 @@ export function createApp(): Express {
       res.status(503).json({ status: 'shutting_down' });
       return;
     }
+    if (!indexesReady) {
+      res.status(503).json({ status: 'starting' });
+      return;
+    }
     try {
-      await prisma.$queryRaw`SELECT 1`;
+      await prisma.$runCommandRaw({ ping: 1 });
       res.json({ status: 'ready' });
     } catch {
       res.status(503).json({ status: 'unavailable' });

@@ -11,9 +11,11 @@ const EnvSchema = z
     PORT: z.coerce.number().int().min(1).max(65535).default(4000),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 
-    DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
-    DIRECT_URL: z.url({ protocol: /^postgres(ql)?$/ }).optional(),
-    DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+    // MongoDB (Atlas replica set in staging/production; mongodb-memory-server in tests).
+    // Must be a replica-set or mongos URI: the API relies on multi-document transactions.
+    MONGODB_URI: z.url({ protocol: /^mongodb(\+srv)?$/ }),
+    MONGODB_DB: z.string().min(1).max(64).default('carevanta'),
+    // Upper bound for a single query; Prisma applies it as maxTimeMS through the transaction options.
     DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(15_000),
 
     // Access tokens: HS256 JWT signed with JWT_SECRET (>= 32 bytes of entropy).
@@ -45,6 +47,16 @@ const EnvSchema = z
     RAZORPAY_KEY_ID: z.string().optional(),
     RAZORPAY_KEY_SECRET: z.string().optional(),
     RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
+    /** Public base URL of this API (for webhook URLs shown to admins), e.g. https://api.carevanta.in */
+    PUBLIC_API_URL: z.string().url().optional(),
+
+    // Place search / reverse geocoding proxy (GET /public/geo/search, /reverse). Free services only:
+    // nominatim (OpenStreetMap, no key, 1 request/s, needs a contact e-mail in the User-Agent) or
+    // locationiq (free tier 5,000/day, Nominatim-compatible, needs GEOCODER_API_KEY). Keys live in .env only.
+    GEOCODER_PROVIDER: z.enum(['nominatim', 'locationiq']).default('nominatim'),
+    // Blank lines in .env (as in .env.example) count as "not set".
+    GEOCODER_API_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
+    GEOCODER_CONTACT_EMAIL: z.preprocess((v) => (v === '' ? undefined : v), z.string().email().optional()),
 
     STORAGE_DRIVER: z.enum(['local']).default('local'),
     STORAGE_LOCAL_DIR: z.string().default('./storage'),

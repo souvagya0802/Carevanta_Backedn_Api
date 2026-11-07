@@ -183,40 +183,40 @@ enum ConfirmationSource {
 /// The doctor ↔ facility relationship. One Doctor provider can hold many
 /// affiliations; the hospital never owns or duplicates the doctor's identity.
 model DoctorAffiliation {
-  id                 String               @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  doctorProviderId   String               @map("doctor_provider_id") @db.Uuid
-  facilityProviderId String               @map("facility_provider_id") @db.Uuid
-  locationId         String?              @map("location_id") @db.Uuid
-  departmentId       String?              @map("department_id") @db.Uuid
-  roleTitle          String?              @map("role_title") @db.VarChar(120)
+  id                 String               @id @map("_id") @default(uuid(7))
+  doctorProviderId   String               @map("doctor_provider_id")
+  facilityProviderId String               @map("facility_provider_id")
+  locationId         String?              @map("location_id")
+  departmentId       String?              @map("department_id")
+  roleTitle          String?              @map("role_title")
   engagementType     EngagementType       @default(VISITING) @map("engagement_type")
   consultationFeeMinor BigInt?            @map("consultation_fee_minor")
-  currency           String               @default("INR") @db.Char(3)
+  currency           String               @default("INR")
   status             AffiliationStatus
   initiatedBy        AffiliationInitiator @map("initiated_by")
-  requestedById      String?              @map("requested_by_id") @db.Uuid
-  doctorConfirmedAt  DateTime?            @map("doctor_confirmed_at") @db.Timestamptz(3)
-  facilityConfirmedAt DateTime?           @map("facility_confirmed_at") @db.Timestamptz(3)
-  verifiedById       String?              @map("verified_by_id") @db.Uuid
-  verifiedAt         DateTime?            @map("verified_at") @db.Timestamptz(3)
-  startDate          DateTime?            @map("start_date") @db.Date
-  endDate            DateTime?            @map("end_date") @db.Date
-  statusReason       String?              @map("status_reason") @db.VarChar(1000)
+  requestedById      String?              @map("requested_by_id")
+  doctorConfirmedAt  DateTime?            @map("doctor_confirmed_at")
+  facilityConfirmedAt DateTime?           @map("facility_confirmed_at")
+  verifiedById       String?              @map("verified_by_id")
+  verifiedAt         DateTime?            @map("verified_at")
+  startDate          DateTime?            @map("start_date")
+  endDate            DateTime?            @map("end_date")
+  statusReason       String?              @map("status_reason")
   version            Int                  @default(1)
-  createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
 
-  doctor     Provider          @relation("AffiliationDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict)
-  facility   Provider          @relation("AffiliationFacility", fields: [facilityProviderId], references: [id], onDelete: Restrict)
-  location   ProviderLocation? @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  department Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  doctor     Provider          @relation("AffiliationDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  facility   Provider          @relation("AffiliationFacility", fields: [facilityProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location   ProviderLocation? @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  department Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   events     AffiliationEvent[]
   schedules  DoctorSchedule[]
   slots      AppointmentSlot[]
   appointments Appointment[]
 
   // At most one live (non-terminal) affiliation per doctor+facility.
-  @@unique([doctorProviderId, facilityProviderId], where: raw("status = ANY (ARRAY['INVITED'::\"AffiliationStatus\", 'REQUESTED'::\"AffiliationStatus\", 'PENDING_VERIFICATION'::\"AffiliationStatus\", 'ACTIVE'::\"AffiliationStatus\", 'SUSPENDED'::\"AffiliationStatus\"])"), map: "doctor_affiliations_one_live")
+  @@index([doctorProviderId, facilityProviderId]) // runtime partial index: doctor_affiliations_one_live
   @@index([facilityProviderId, status])
   @@index([doctorProviderId, status])
   @@index([status, createdAt])
@@ -224,16 +224,16 @@ model DoctorAffiliation {
 }
 
 model AffiliationEvent {
-  id            String             @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  affiliationId String             @map("affiliation_id") @db.Uuid
+  id            String             @id @map("_id") @default(uuid(7))
+  affiliationId String             @map("affiliation_id")
   fromStatus    AffiliationStatus? @map("from_status")
   toStatus      AffiliationStatus  @map("to_status")
-  actorUserId   String?            @map("actor_user_id") @db.Uuid
-  actorKind     String             @map("actor_kind") @db.VarChar(24) // DOCTOR | FACILITY | PLATFORM | SYSTEM
-  note          String?            @db.VarChar(1000)
-  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  actorUserId   String?            @map("actor_user_id")
+  actorKind     String             @map("actor_kind") // DOCTOR | FACILITY | PLATFORM | SYSTEM
+  note          String?
+  createdAt     DateTime           @default(now()) @map("created_at")
 
-  affiliation DoctorAffiliation @relation(fields: [affiliationId], references: [id], onDelete: Cascade)
+  affiliation DoctorAffiliation @relation(fields: [affiliationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([affiliationId, createdAt])
   @@map("affiliation_events")
@@ -241,26 +241,26 @@ model AffiliationEvent {
 
 /// Recurring weekly template used to generate AppointmentSlots.
 model DoctorSchedule {
-  id               String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  doctorProviderId String    @map("doctor_provider_id") @db.Uuid
-  locationId       String    @map("location_id") @db.Uuid
-  affiliationId    String?   @map("affiliation_id") @db.Uuid
-  dayOfWeek        Int       @map("day_of_week") @db.SmallInt
-  startMinute      Int       @map("start_minute") @db.SmallInt
-  endMinute        Int       @map("end_minute") @db.SmallInt
-  slotMinutes      Int       @map("slot_minutes") @db.SmallInt
-  capacityPerSlot  Int       @default(1) @map("capacity_per_slot") @db.SmallInt
+  id               String    @id @map("_id") @default(uuid(7))
+  doctorProviderId String    @map("doctor_provider_id")
+  locationId       String    @map("location_id")
+  affiliationId    String?   @map("affiliation_id")
+  dayOfWeek        Int       @map("day_of_week")
+  startMinute      Int       @map("start_minute")
+  endMinute        Int       @map("end_minute")
+  slotMinutes      Int       @map("slot_minutes")
+  capacityPerSlot  Int       @default(1) @map("capacity_per_slot")
   feeMinor         BigInt?   @map("fee_minor")
-  validFrom        DateTime  @map("valid_from") @db.Date
-  validTo          DateTime? @map("valid_to") @db.Date
+  validFrom        DateTime  @map("valid_from")
+  validTo          DateTime? @map("valid_to")
   isActive         Boolean   @default(true) @map("is_active")
-  createdById      String?   @map("created_by_id") @db.Uuid
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdById      String?   @map("created_by_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
 
-  doctor      Provider           @relation("ScheduleDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict)
-  location    ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  affiliation DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict)
+  doctor      Provider           @relation("ScheduleDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location    ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  affiliation DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   slots       AppointmentSlot[]
 
   @@index([doctorProviderId, isActive])
@@ -272,50 +272,50 @@ model DoctorSchedule {
 /// database EXCLUDE constraint stopping a doctor from having overlapping open
 /// slots at two locations (see migration SQL).
 model AppointmentSlot {
-  id               String     @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  doctorProviderId String     @map("doctor_provider_id") @db.Uuid
-  locationId       String     @map("location_id") @db.Uuid
-  affiliationId    String?    @map("affiliation_id") @db.Uuid
-  scheduleId       String?    @map("schedule_id") @db.Uuid
-  startsAt         DateTime   @map("starts_at") @db.Timestamptz(3)
-  endsAt           DateTime   @map("ends_at") @db.Timestamptz(3)
-  capacity         Int        @default(1) @db.SmallInt
-  bookedCount      Int        @default(0) @map("booked_count") @db.SmallInt
+  id               String     @id @map("_id") @default(uuid(7))
+  doctorProviderId String     @map("doctor_provider_id")
+  locationId       String     @map("location_id")
+  affiliationId    String?    @map("affiliation_id")
+  scheduleId       String?    @map("schedule_id")
+  startsAt         DateTime   @map("starts_at")
+  endsAt           DateTime   @map("ends_at")
+  capacity         Int        @default(1)
+  bookedCount      Int        @default(0) @map("booked_count")
   status           SlotStatus @default(OPEN)
   feeMinor         BigInt     @map("fee_minor")
-  currency         String     @default("INR") @db.Char(3)
+  currency         String     @default("INR")
   version          Int        @default(1)
-  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt        DateTime   @default(now()) @map("created_at")
+  updatedAt        DateTime   @updatedAt @map("updated_at")
 
-  doctor       Provider           @relation("SlotDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict)
-  location     ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  affiliation  DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict)
-  schedule     DoctorSchedule?    @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  doctor       Provider           @relation("SlotDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location     ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  affiliation  DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  schedule     DoctorSchedule?    @relation(fields: [scheduleId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   appointments Appointment[]
 
   @@unique([doctorProviderId, locationId, startsAt])
   @@index([locationId, startsAt])
   @@index([startsAt]) // "appointments today" and other time-window reports
-  @@index([doctorProviderId, startsAt], where: raw("status = 'OPEN'"), map: "appointment_slots_open_by_doctor")
+  @@index([doctorProviderId, startsAt]) // runtime partial index: appointment_slots_open_by_doctor
   @@map("appointment_slots")
 }
 
 /// Person receiving care. One account holder can manage dependants; the
 /// account holder and the patient are deliberately different entities.
 model PatientProfile {
-  id                String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  accountUserId     String              @map("account_user_id") @db.Uuid
-  fullName          String              @map("full_name") @db.VarChar(160)
+  id                String              @id @map("_id") @default(uuid(7))
+  accountUserId     String              @map("account_user_id")
+  fullName          String              @map("full_name")
   relationship      PatientRelationship @default(SELF)
-  dateOfBirth       DateTime?           @map("date_of_birth") @db.Date
-  gender            String?             @db.VarChar(24)
-  phone             String?             @db.VarChar(16)
+  dateOfBirth       DateTime?           @map("date_of_birth")
+  gender            String?
+  phone             String?
   isActive          Boolean             @default(true) @map("is_active")
-  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt         DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
 
-  accountHolder    User               @relation("PatientAccountHolder", fields: [accountUserId], references: [id], onDelete: Restrict)
+  accountHolder    User               @relation("PatientAccountHolder", fields: [accountUserId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   appointments     Appointment[]
   diagnosticOrders DiagnosticOrder[]
   pharmacyOrders   PharmacyOrder[]
@@ -323,53 +323,52 @@ model PatientProfile {
   consents         ConsentRecord[]
   transactions     ServiceTransaction[]
 
-  @@unique([accountUserId], where: raw("relationship = 'SELF'"), map: "patient_profiles_one_self")
   @@index([accountUserId])
   @@map("patient_profiles")
 }
 
 model Appointment {
-  id                 String            @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference          String            @unique @db.VarChar(24)
-  patientProfileId   String            @map("patient_profile_id") @db.Uuid
-  bookedByUserId     String            @map("booked_by_user_id") @db.Uuid
-  doctorProviderId   String            @map("doctor_provider_id") @db.Uuid
-  facilityProviderId String            @map("facility_provider_id") @db.Uuid
-  locationId         String            @map("location_id") @db.Uuid
-  slotId             String            @map("slot_id") @db.Uuid
-  affiliationId      String?           @map("affiliation_id") @db.Uuid
+  id                 String            @id @map("_id") @default(uuid(7))
+  reference          String            @unique
+  patientProfileId   String            @map("patient_profile_id")
+  bookedByUserId     String            @map("booked_by_user_id")
+  doctorProviderId   String            @map("doctor_provider_id")
+  facilityProviderId String            @map("facility_provider_id")
+  locationId         String            @map("location_id")
+  slotId             String            @map("slot_id")
+  affiliationId      String?           @map("affiliation_id")
   mode               ConsultationMode  @default(IN_PERSON)
   status             AppointmentStatus @default(REQUESTED)
   source             BookingSource
   attribution        Attribution
   feeMinor           BigInt            @map("fee_minor")
-  currency           String            @default("INR") @db.Char(3)
-  reasonForVisit     String?           @map("reason_for_visit") @db.VarChar(500)
-  rescheduledFromId  String?           @unique @map("rescheduled_from_id") @db.Uuid
-  idempotencyKey     String?           @map("idempotency_key") @db.VarChar(80)
-  statusReason       String?           @map("status_reason") @db.VarChar(1000)
-  confirmedAt        DateTime?         @map("confirmed_at") @db.Timestamptz(3)
-  checkedInAt        DateTime?         @map("checked_in_at") @db.Timestamptz(3)
-  completedAt        DateTime?         @map("completed_at") @db.Timestamptz(3)
-  cancelledAt        DateTime?         @map("cancelled_at") @db.Timestamptz(3)
+  currency           String            @default("INR")
+  reasonForVisit     String?           @map("reason_for_visit")
+  rescheduledFromId  String?           @unique @map("rescheduled_from_id")
+  idempotencyKey     String?           @map("idempotency_key")
+  statusReason       String?           @map("status_reason")
+  confirmedAt        DateTime?         @map("confirmed_at")
+  checkedInAt        DateTime?         @map("checked_in_at")
+  completedAt        DateTime?         @map("completed_at")
+  cancelledAt        DateTime?         @map("cancelled_at")
   version            Int               @default(1)
-  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
 
-  patient         PatientProfile     @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
-  doctor          Provider           @relation("AppointmentDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict)
-  facility        Provider           @relation("AppointmentFacility", fields: [facilityProviderId], references: [id], onDelete: Restrict)
-  location        ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  slot            AppointmentSlot    @relation(fields: [slotId], references: [id], onDelete: Restrict)
-  affiliation     DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict)
-  rescheduledFrom Appointment?       @relation("Reschedule", fields: [rescheduledFromId], references: [id], onDelete: Restrict)
+  patient         PatientProfile     @relation(fields: [patientProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  doctor          Provider           @relation("AppointmentDoctor", fields: [doctorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  facility        Provider           @relation("AppointmentFacility", fields: [facilityProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location        ProviderLocation   @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  slot            AppointmentSlot    @relation(fields: [slotId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  affiliation     DoctorAffiliation? @relation(fields: [affiliationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  rescheduledFrom Appointment?       @relation("Reschedule", fields: [rescheduledFromId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   rescheduledTo   Appointment?       @relation("Reschedule")
   events          AppointmentEvent[]
   transaction     ServiceTransaction?
 
   @@unique([bookedByUserId, idempotencyKey])
   // A patient cannot hold two live bookings in the same slot.
-  @@unique([patientProfileId, slotId], where: raw("status = ANY (ARRAY['REQUESTED'::\"AppointmentStatus\", 'CONFIRMED'::\"AppointmentStatus\", 'CHECKED_IN'::\"AppointmentStatus\"])"), map: "appointments_patient_slot_live")
+  @@index([patientProfileId, slotId]) // runtime partial index: appointments_patient_slot_live
   @@index([doctorProviderId, createdAt(sort: Desc)])
   @@index([facilityProviderId, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
@@ -380,47 +379,49 @@ model Appointment {
 }
 
 model AppointmentEvent {
-  id            String             @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  appointmentId String             @map("appointment_id") @db.Uuid
+  id            String             @id @map("_id") @default(uuid(7))
+  appointmentId String             @map("appointment_id")
   fromStatus    AppointmentStatus? @map("from_status")
   toStatus      AppointmentStatus  @map("to_status")
-  actorUserId   String?            @map("actor_user_id") @db.Uuid
-  actorKind     String             @map("actor_kind") @db.VarChar(24)
-  note          String?            @db.VarChar(1000)
-  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  actorUserId   String?            @map("actor_user_id")
+  actorKind     String             @map("actor_kind")
+  note          String?
+  createdAt     DateTime           @default(now()) @map("created_at")
 
-  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([appointmentId, createdAt])
   @@map("appointment_events")
 }
 
 model DiagnosticOrder {
-  id               String                @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference        String                @unique @db.VarChar(24)
-  patientProfileId String                @map("patient_profile_id") @db.Uuid
-  bookedByUserId   String                @map("booked_by_user_id") @db.Uuid
-  providerId       String                @map("provider_id") @db.Uuid
-  locationId       String?               @map("location_id") @db.Uuid
+  id               String                @id @map("_id") @default(uuid(7))
+  reference        String                @unique
+  patientProfileId String                @map("patient_profile_id")
+  bookedByUserId   String                @map("booked_by_user_id")
+  providerId       String                @map("provider_id")
+  locationId       String?               @map("location_id")
   collectionMode   CollectionMode        @default(CENTRE_VISIT) @map("collection_mode")
-  scheduledAt      DateTime?             @map("scheduled_at") @db.Timestamptz(3)
-  collectionPincode String?              @map("collection_pincode") @db.Char(6)
-  prescriptionId   String?               @map("prescription_id") @db.Uuid
+  scheduledAt      DateTime?             @map("scheduled_at")
+  collectionPincode String?              @map("collection_pincode")
+  prescriptionId   String?               @map("prescription_id")
   status           DiagnosticOrderStatus @default(REQUESTED)
   source           BookingSource
   attribution      Attribution
   totalMinor       BigInt                @map("total_minor")
-  currency         String                @default("INR") @db.Char(3)
-  statusReason     String?               @map("status_reason") @db.VarChar(1000)
-  idempotencyKey   String?               @map("idempotency_key") @db.VarChar(80)
-  completedAt      DateTime?             @map("completed_at") @db.Timestamptz(3)
+  currency         String                @default("INR")
+  statusReason     String?               @map("status_reason")
+  idempotencyKey   String?               @map("idempotency_key")
+  completedAt      DateTime?             @map("completed_at")
   version          Int                   @default(1)
-  createdAt        DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt        DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime              @updatedAt @map("updated_at")
 
-  patient      PatientProfile        @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
-  provider     Provider              @relation(fields: [providerId], references: [id], onDelete: Restrict)
-  prescription Prescription?         @relation(fields: [prescriptionId], references: [id], onDelete: SetNull)
+  patient      PatientProfile        @relation(fields: [patientProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  provider     Provider              @relation(fields: [providerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  /// Centre the patient visits (null for home collection); carried so order screens can show a map.
+  location     ProviderLocation?     @relation("DiagnosticOrderLocation", fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  prescription Prescription?         @relation(fields: [prescriptionId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   items        DiagnosticOrderItem[]
   reports      DiagnosticReport[]
   transaction  ServiceTransaction?
@@ -433,14 +434,14 @@ model DiagnosticOrder {
 }
 
 model DiagnosticOrderItem {
-  id                String  @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  orderId           String  @map("order_id") @db.Uuid
-  providerServiceId String  @map("provider_service_id") @db.Uuid
-  serviceName       String  @map("service_name") @db.VarChar(200) // snapshot
+  id                String  @id @map("_id") @default(uuid(7))
+  orderId           String  @map("order_id")
+  providerServiceId String  @map("provider_service_id")
+  serviceName       String  @map("service_name") // snapshot
   priceMinor        BigInt  @map("price_minor") // snapshot at booking time
 
-  order           DiagnosticOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  providerService ProviderService @relation(fields: [providerServiceId], references: [id], onDelete: Restrict)
+  order           DiagnosticOrder @relation(fields: [orderId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  providerService ProviderService @relation(fields: [providerServiceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([orderId])
   @@map("diagnostic_order_items")
@@ -450,20 +451,20 @@ model DiagnosticOrderItem {
 /// Corrections create a new version that supersedes the old one; old versions
 /// are retained, never silently replaced.
 model DiagnosticReport {
-  id               String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  orderId          String       @map("order_id") @db.Uuid
+  id               String       @id @map("_id") @default(uuid(7))
+  orderId          String       @map("order_id")
   version          Int          @default(1)
   status           ReportStatus @default(DRAFT)
-  storageKey       String       @unique @map("storage_key") @db.VarChar(300)
-  sha256           String       @db.Char(64)
-  supersedesId     String?      @unique @map("supersedes_id") @db.Uuid
-  correctionReason String?      @map("correction_reason") @db.VarChar(1000)
-  publishedById    String?      @map("published_by_id") @db.Uuid
-  publishedAt      DateTime?    @map("published_at") @db.Timestamptz(3)
-  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  storageKey       String       @unique @map("storage_key")
+  sha256           String
+  supersedesId     String?      @unique @map("supersedes_id")
+  correctionReason String?      @map("correction_reason")
+  publishedById    String?      @map("published_by_id")
+  publishedAt      DateTime?    @map("published_at")
+  createdAt        DateTime     @default(now()) @map("created_at")
 
-  order      DiagnosticOrder   @relation(fields: [orderId], references: [id], onDelete: Restrict)
-  supersedes DiagnosticReport? @relation("ReportVersion", fields: [supersedesId], references: [id], onDelete: Restrict)
+  order      DiagnosticOrder   @relation(fields: [orderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  supersedes DiagnosticReport? @relation("ReportVersion", fields: [supersedesId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   supersededBy DiagnosticReport? @relation("ReportVersion")
 
   @@unique([orderId, version])
@@ -471,21 +472,21 @@ model DiagnosticReport {
 }
 
 model Prescription {
-  id               String                   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  patientProfileId String                   @map("patient_profile_id") @db.Uuid
-  uploadedByUserId String                   @map("uploaded_by_user_id") @db.Uuid
-  issuedByDoctorProviderId String?          @map("issued_by_doctor_provider_id") @db.Uuid
-  storageKey       String                   @unique @map("storage_key") @db.VarChar(300)
-  sha256           String                   @db.Char(64)
+  id               String                   @id @map("_id") @default(uuid(7))
+  patientProfileId String                   @map("patient_profile_id")
+  uploadedByUserId String                   @map("uploaded_by_user_id")
+  issuedByDoctorProviderId String?          @map("issued_by_doctor_provider_id")
+  storageKey       String                   @unique @map("storage_key")
+  sha256           String
   reviewStatus     PrescriptionReviewStatus @default(PENDING) @map("review_status")
-  reviewedByUserId String?                  @map("reviewed_by_user_id") @db.Uuid
-  reviewedAt       DateTime?                @map("reviewed_at") @db.Timestamptz(3)
-  reviewNote       String?                  @map("review_note") @db.VarChar(1000)
-  issuedOn         DateTime?                @map("issued_on") @db.Date
-  validUntil       DateTime?                @map("valid_until") @db.Date
-  createdAt        DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  reviewedByUserId String?                  @map("reviewed_by_user_id")
+  reviewedAt       DateTime?                @map("reviewed_at")
+  reviewNote       String?                  @map("review_note")
+  issuedOn         DateTime?                @map("issued_on")
+  validUntil       DateTime?                @map("valid_until")
+  createdAt        DateTime                 @default(now()) @map("created_at")
 
-  patient          PatientProfile    @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
+  patient          PatientProfile    @relation(fields: [patientProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   diagnosticOrders DiagnosticOrder[]
   pharmacyOrders   PharmacyOrder[]
 
@@ -494,24 +495,24 @@ model Prescription {
 }
 
 model PharmacyInventory {
-  id                String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  providerId        String   @map("provider_id") @db.Uuid
-  locationId        String   @map("location_id") @db.Uuid
-  medicineId        String   @map("medicine_id") @db.Uuid
-  batchNumber       String   @map("batch_number") @db.VarChar(64)
-  expiryDate        DateTime @map("expiry_date") @db.Date
+  id                String   @id @map("_id") @default(uuid(7))
+  providerId        String   @map("provider_id")
+  locationId        String   @map("location_id")
+  medicineId        String   @map("medicine_id")
+  batchNumber       String   @map("batch_number")
+  expiryDate        DateTime @map("expiry_date")
   quantityOnHand    Int      @map("quantity_on_hand")
   quantityReserved  Int      @default(0) @map("quantity_reserved")
   mrpMinor          BigInt   @map("mrp_minor")
   sellingPriceMinor BigInt   @map("selling_price_minor")
-  currency          String   @default("INR") @db.Char(3)
+  currency          String   @default("INR")
   version           Int      @default(1)
-  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
 
-  provider   Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict)
-  location   ProviderLocation    @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  medicine   Medicine            @relation(fields: [medicineId], references: [id], onDelete: Restrict)
+  provider   Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location   ProviderLocation    @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  medicine   Medicine            @relation(fields: [medicineId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   orderItems PharmacyOrderItem[]
 
   @@unique([locationId, medicineId, batchNumber])
@@ -521,30 +522,30 @@ model PharmacyInventory {
 }
 
 model PharmacyOrder {
-  id               String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference        String              @unique @db.VarChar(24)
-  patientProfileId String              @map("patient_profile_id") @db.Uuid
-  bookedByUserId   String              @map("booked_by_user_id") @db.Uuid
-  providerId       String              @map("provider_id") @db.Uuid
-  locationId       String?             @map("location_id") @db.Uuid
+  id               String              @id @map("_id") @default(uuid(7))
+  reference        String              @unique
+  patientProfileId String              @map("patient_profile_id")
+  bookedByUserId   String              @map("booked_by_user_id")
+  providerId       String              @map("provider_id")
+  locationId       String?             @map("location_id")
   fulfilment       FulfilmentMode      @default(PICKUP)
-  deliveryPincode  String?             @map("delivery_pincode") @db.Char(6)
-  prescriptionId   String?             @map("prescription_id") @db.Uuid
+  deliveryPincode  String?             @map("delivery_pincode")
+  prescriptionId   String?             @map("prescription_id")
   status           PharmacyOrderStatus @default(PLACED)
   source           BookingSource
   attribution      Attribution
   totalMinor       BigInt              @map("total_minor")
-  currency         String              @default("INR") @db.Char(3)
-  statusReason     String?             @map("status_reason") @db.VarChar(1000)
-  idempotencyKey   String?             @map("idempotency_key") @db.VarChar(80)
-  completedAt      DateTime?           @map("completed_at") @db.Timestamptz(3)
+  currency         String              @default("INR")
+  statusReason     String?             @map("status_reason")
+  idempotencyKey   String?             @map("idempotency_key")
+  completedAt      DateTime?           @map("completed_at")
   version          Int                 @default(1)
-  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt        DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
 
-  patient      PatientProfile      @relation(fields: [patientProfileId], references: [id], onDelete: Restrict)
-  provider     Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict)
-  prescription Prescription?       @relation(fields: [prescriptionId], references: [id], onDelete: SetNull)
+  patient      PatientProfile      @relation(fields: [patientProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  provider     Provider            @relation(fields: [providerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  prescription Prescription?       @relation(fields: [prescriptionId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   items        PharmacyOrderItem[]
   transaction  ServiceTransaction?
 
@@ -555,43 +556,43 @@ model PharmacyOrder {
 }
 
 model PharmacyOrderItem {
-  id             String  @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  orderId        String  @map("order_id") @db.Uuid
-  medicineId     String  @map("medicine_id") @db.Uuid
-  inventoryId    String? @map("inventory_id") @db.Uuid
+  id             String  @id @map("_id") @default(uuid(7))
+  orderId        String  @map("order_id")
+  medicineId     String  @map("medicine_id")
+  inventoryId    String? @map("inventory_id")
   quantity       Int
   unitPriceMinor BigInt  @map("unit_price_minor")
   // Substitution is only recorded with pharmacist + patient authorisation.
-  substitutedForMedicineId String? @map("substituted_for_medicine_id") @db.Uuid
+  substitutedForMedicineId String? @map("substituted_for_medicine_id")
 
-  order     PharmacyOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  medicine  Medicine           @relation(fields: [medicineId], references: [id], onDelete: Restrict)
-  inventory PharmacyInventory? @relation(fields: [inventoryId], references: [id], onDelete: Restrict)
+  order     PharmacyOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  medicine  Medicine           @relation(fields: [medicineId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  inventory PharmacyInventory? @relation(fields: [inventoryId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([orderId])
   @@map("pharmacy_order_items")
 }
 
 model AmbulanceVehicle {
-  id                 String        @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  operatorProviderId String        @map("operator_provider_id") @db.Uuid
-  baseLocationId     String?       @map("base_location_id") @db.Uuid
-  registrationNumber String        @unique @map("registration_number") @db.VarChar(16)
+  id                 String        @id @map("_id") @default(uuid(7))
+  operatorProviderId String        @map("operator_provider_id")
+  baseLocationId     String?       @map("base_location_id")
+  registrationNumber String        @unique @map("registration_number")
   vehicleType        VehicleType   @map("vehicle_type")
   status             VehicleStatus @default(PENDING_VERIFICATION)
-  equipment          String[]      @default([]) @db.VarChar(64)
-  insuranceValidUntil DateTime?    @map("insurance_valid_until") @db.Date
-  fitnessValidUntil  DateTime?     @map("fitness_valid_until") @db.Date
-  lastKnownLatitude  Decimal?      @map("last_known_latitude") @db.Decimal(9, 6)
-  lastKnownLongitude Decimal?      @map("last_known_longitude") @db.Decimal(9, 6)
-  lastLocationAt     DateTime?     @map("last_location_at") @db.Timestamptz(3)
-  verifiedAt         DateTime?     @map("verified_at") @db.Timestamptz(3)
-  verifiedById       String?       @map("verified_by_id") @db.Uuid
-  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  equipment          String[]      @default([])
+  insuranceValidUntil DateTime?    @map("insurance_valid_until")
+  fitnessValidUntil  DateTime?     @map("fitness_valid_until")
+  lastKnownLatitude  Float?      @map("last_known_latitude")
+  lastKnownLongitude Float?      @map("last_known_longitude")
+  lastLocationAt     DateTime?     @map("last_location_at")
+  verifiedAt         DateTime?     @map("verified_at")
+  verifiedById       String?       @map("verified_by_id")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
 
-  operator     Provider             @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict)
-  baseLocation ProviderLocation?    @relation(fields: [baseLocationId], references: [id], onDelete: SetNull)
+  operator     Provider             @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  baseLocation ProviderLocation?    @relation(fields: [baseLocationId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   assignments  DispatchAssignment[]
 
   @@index([operatorProviderId, status])
@@ -599,43 +600,43 @@ model AmbulanceVehicle {
 }
 
 model AmbulanceCrewMember {
-  id                 String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  operatorProviderId String   @map("operator_provider_id") @db.Uuid
-  userId             String?  @map("user_id") @db.Uuid
-  fullName           String   @map("full_name") @db.VarChar(160)
+  id                 String   @id @map("_id") @default(uuid(7))
+  operatorProviderId String   @map("operator_provider_id")
+  userId             String?  @map("user_id")
+  fullName           String   @map("full_name")
   role               CrewRole
-  licenseNumber      String?  @map("license_number") @db.VarChar(64)
-  licenseValidUntil  DateTime? @map("license_valid_until") @db.Date
+  licenseNumber      String?  @map("license_number")
+  licenseValidUntil  DateTime? @map("license_valid_until")
   isActive           Boolean  @default(true) @map("is_active")
-  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdAt          DateTime @default(now()) @map("created_at")
 
-  operator Provider @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict)
+  operator Provider @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([operatorProviderId])
   @@map("ambulance_crew_members")
 }
 
 model DispatchRequest {
-  id                    String         @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  reference             String         @unique @db.VarChar(24)
+  id                    String         @id @map("_id") @default(uuid(7))
+  reference             String         @unique
   mode                  DispatchMode
   status                DispatchStatus @default(RECEIVED)
-  requestedByUserId     String?        @map("requested_by_user_id") @db.Uuid
-  callerPhone           String?        @map("caller_phone") @db.VarChar(16)
-  pickupLatitude        Decimal?       @map("pickup_latitude") @db.Decimal(9, 6)
-  pickupLongitude       Decimal?       @map("pickup_longitude") @db.Decimal(9, 6)
-  pickupAddress         String?        @map("pickup_address") @db.VarChar(500)
-  pickupDistrict        String?        @map("pickup_district") @db.VarChar(80)
-  destinationProviderId String?        @map("destination_provider_id") @db.Uuid
+  requestedByUserId     String?        @map("requested_by_user_id")
+  callerPhone           String?        @map("caller_phone")
+  pickupLatitude        Float?       @map("pickup_latitude")
+  pickupLongitude       Float?       @map("pickup_longitude")
+  pickupAddress         String?        @map("pickup_address")
+  pickupDistrict        String?        @map("pickup_district")
+  destinationProviderId String?        @map("destination_provider_id")
   requiredVehicleType   VehicleType?   @map("required_vehicle_type")
-  emergencyGuidanceShownAt DateTime?   @map("emergency_guidance_shown_at") @db.Timestamptz(3)
-  escalatedAt           DateTime?      @map("escalated_at") @db.Timestamptz(3)
-  escalationNote        String?        @map("escalation_note") @db.VarChar(1000)
-  closedAt              DateTime?      @map("closed_at") @db.Timestamptz(3)
-  closeReason           String?        @map("close_reason") @db.VarChar(500)
+  emergencyGuidanceShownAt DateTime?   @map("emergency_guidance_shown_at")
+  escalatedAt           DateTime?      @map("escalated_at")
+  escalationNote        String?        @map("escalation_note")
+  closedAt              DateTime?      @map("closed_at")
+  closeReason           String?        @map("close_reason")
   version               Int            @default(1)
-  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt             DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt             DateTime       @default(now()) @map("created_at")
+  updatedAt             DateTime       @updatedAt @map("updated_at")
 
   assignments DispatchAssignment[]
   events      DispatchEvent[]
@@ -647,40 +648,39 @@ model DispatchRequest {
 }
 
 model DispatchAssignment {
-  id                 String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  requestId          String              @map("request_id") @db.Uuid
-  operatorProviderId String              @map("operator_provider_id") @db.Uuid
-  vehicleId          String?             @map("vehicle_id") @db.Uuid
+  id                 String              @id @map("_id") @default(uuid(7))
+  requestId          String              @map("request_id")
+  operatorProviderId String              @map("operator_provider_id")
+  vehicleId          String?             @map("vehicle_id")
   status             AssignmentStatus    @default(OFFERED)
   confirmationSource ConfirmationSource? @map("confirmation_source")
-  confirmedByUserId  String?             @map("confirmed_by_user_id") @db.Uuid
-  offeredAt          DateTime            @default(now()) @map("offered_at") @db.Timestamptz(3)
-  respondedAt        DateTime?           @map("responded_at") @db.Timestamptz(3)
+  confirmedByUserId  String?             @map("confirmed_by_user_id")
+  offeredAt          DateTime            @default(now()) @map("offered_at")
+  respondedAt        DateTime?           @map("responded_at")
   etaMinutes         Int?                @map("eta_minutes")
-  note               String?             @db.VarChar(500)
+  note               String?
 
-  request  DispatchRequest   @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  operator Provider          @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict)
-  vehicle  AmbulanceVehicle? @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  request  DispatchRequest   @relation(fields: [requestId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  operator Provider          @relation(fields: [operatorProviderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  vehicle  AmbulanceVehicle? @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   // Only one accepted assignment per request.
-  @@unique([requestId], where: raw("status = 'ACCEPTED'"), map: "dispatch_assignments_one_accepted")
   @@index([requestId])
   @@index([vehicleId, status])
   @@map("dispatch_assignments")
 }
 
 model DispatchEvent {
-  id          String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
-  requestId   String          @map("request_id") @db.Uuid
+  id          String          @id @map("_id") @default(uuid(7))
+  requestId   String          @map("request_id")
   fromStatus  DispatchStatus? @map("from_status")
   toStatus    DispatchStatus  @map("to_status")
-  actorUserId String?         @map("actor_user_id") @db.Uuid
-  actorKind   String          @map("actor_kind") @db.VarChar(24)
-  note        String?         @db.VarChar(1000)
-  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  actorUserId String?         @map("actor_user_id")
+  actorKind   String          @map("actor_kind")
+  note        String?
+  createdAt   DateTime        @default(now()) @map("created_at")
 
-  request DispatchRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  request DispatchRequest @relation(fields: [requestId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([requestId, createdAt])
   @@map("dispatch_events")

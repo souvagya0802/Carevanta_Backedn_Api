@@ -5,12 +5,15 @@ import { toJsonMinor } from '../lib/money.js';
 export const iso = (d: Date | null | undefined): string | null => (d ? d.toISOString() : null);
 export const isoDate = (d: Date | null | undefined): string | null => (d ? d.toISOString().slice(0, 10) : null);
 export const minor = (v: bigint | null | undefined): number | null => toJsonMinor(v);
-export const dec = (v: { toNumber(): number } | null | undefined): number | null => (v == null ? null : v.toNumber());
+/** Numeric column → JSON number. Accepts plain numbers (MongoDB Float columns) and Decimal-like values. */
+export const dec = (v: number | { toNumber(): number } | null | undefined): number | null => (v == null ? null : typeof v === 'number' ? v : v.toNumber());
 
 export const Money = z.number().int().describe('Integer minor units (paise)');
 export const MoneyInput = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).describe('Integer minor units (paise)');
 export const Currency = z.literal('INR');
 export const DateString = z.iso.date();
+/** A calendar date that cannot be in the future (date of birth, issue dates). */
+export const BirthDate = DateString.refine((d) => d <= new Date().toISOString().slice(0, 10), { message: 'Date of birth cannot be in the future' });
 export const DateTimeString = z.iso.datetime({ offset: true });
 export const Phone = z
   .string()

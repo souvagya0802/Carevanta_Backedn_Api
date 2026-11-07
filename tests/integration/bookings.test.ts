@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../src/lib/prisma.js';
 import { resetDatabase } from '../helpers/db.js';
 import { actor, idem } from '../helpers/factory.js';
-import { actorForUser, affiliatedDoctor, approveProvider, createHospital, istDate, patient, slotsFor } from '../helpers/fixtures.js';
+import { actorForUser, affiliatedDoctor, approveProvider, createHospital, istDate, patient, slotsFor, istWeekday } from '../helpers/fixtures.js';
 
 beforeAll(resetDatabase);
 
@@ -21,10 +21,11 @@ describe('scheduling', () => {
     // 10:00 IST = 04:30 UTC
     expect(first.startsAt.toISOString().slice(11, 16)).toBe('04:30');
 
-    // Same doctor, same time, their own chamber → EXCLUDE constraint skips them.
-    const own = await slotsFor(ctx.scheduler, ctx.doctor.id, ctx.doctor.locationId!, {});
-    expect(own.created).toBe(0);
-    expect(own.skipped).toBe(4);
+    // Same doctor, same weekday and time at their own chamber: the session itself is refused with a clear reason
+    // (QA PORT-2; the slot-level EXCLUDE constraint remains the last line of defence).
+    const own = await ctx.scheduler.post('/api/v1/schedules', { doctorProviderId: ctx.doctor.id, locationId: ctx.doctor.locationId!, dayOfWeek: istWeekday(istDate(2)), startMinute: 600, endMinute: 720, slotMinutes: 30, capacityPerSlot: 1, validFrom: istDate(0) });
+    expect(own.status).toBe(409);
+    expect(own.body.error.message).toMatch(/overlaps/);
     // Re-running generation is idempotent.
     const again = await ctx.scheduler.post(`/api/v1/schedules/${first.scheduleId}/generate-slots`, { from: istDate(2), to: istDate(2) });
     expect(again.body.data.created).toBe(0);

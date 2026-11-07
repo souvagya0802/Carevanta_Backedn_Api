@@ -1,5 +1,6 @@
 import type { PrismaClient } from '../../generated/prisma/client.js';
 import { syncAccessControl } from '../modules/access/seed-access.js';
+import { CONDITION_TERMS, EXTRA_CONDITIONS, SERVICE_TERMS, SPECIALITY_TERMS, mergeTerms } from './search-vocabulary.js';
 
 /**
  * Reference data required in every environment (including production).
@@ -105,14 +106,18 @@ const SERVICES: Array<{ code: string; name: string; category: 'CONSULTATION' | '
   { code: 'LAB_CBC', name: 'Complete blood count (CBC)', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: false },
   { code: 'LAB_LFT', name: 'Liver function test (LFT)', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: false },
   { code: 'LAB_KFT', name: 'Kidney function test (KFT)', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: false },
-  { code: 'LAB_FBS', name: 'Fasting blood sugar', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: true, prep: 'Provider-supplied fasting instructions must be shown before booking.' },
-  { code: 'LAB_LIPID', name: 'Lipid profile', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: true, prep: 'Provider-supplied fasting instructions must be shown before booking.' },
+  { code: 'LAB_FBS', name: 'Fasting blood sugar', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: true, prep: 'Do not eat or drink anything except plain water for 10 to 12 hours before the test. Take regular medicines only if your doctor says so.' },
+  { code: 'LAB_LIPID', name: 'Lipid profile', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: true, prep: 'Do not eat or drink anything except plain water for 10 to 12 hours before the test. Take regular medicines only if your doctor says so.' },
   { code: 'LAB_THYROID', name: 'Thyroid profile (T3, T4, TSH)', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'BLOOD', fasting: false },
   { code: 'LAB_URINE_RE', name: 'Urine routine examination', category: 'DIAGNOSTIC_TEST', speciality: 'PATHOLOGY', sampleType: 'URINE', fasting: false },
   { code: 'IMG_XRAY_CHEST', name: 'X-ray chest PA view', category: 'IMAGING', speciality: 'RADIOLOGY', rx: true },
   { code: 'IMG_USG_ABDOMEN', name: 'Ultrasound whole abdomen', category: 'IMAGING', speciality: 'RADIOLOGY', rx: true },
   { code: 'IMG_CT_HEAD', name: 'CT scan head (plain)', category: 'IMAGING', speciality: 'RADIOLOGY', rx: true },
   { code: 'PROC_ECG', name: 'Electrocardiogram (ECG)', category: 'PROCEDURE', speciality: 'CARDIOLOGY' },
+  { code: 'IMG_MRI_BRAIN', name: 'MRI brain (plain)', category: 'IMAGING', speciality: 'RADIOLOGY', rx: true, prep: 'Remove all metal (jewellery, hair clips). Tell the centre about any implant or pacemaker.' },
+  { code: 'IMG_XRAY_KNEE', name: 'X-ray knee (AP and lateral)', category: 'IMAGING', speciality: 'RADIOLOGY' },
+  { code: 'IMG_USG_PELVIS', name: 'Ultrasound pelvis', category: 'IMAGING', speciality: 'RADIOLOGY', prep: 'Drink 4 to 5 glasses of water an hour before and do not pass urine.' },
+  { code: 'PROC_ECHO', name: 'Echocardiography (2D Echo)', category: 'PROCEDURE', speciality: 'CARDIOLOGY' },
 ];
 
 const TEMPLATES: Array<{ key: string; channel: 'EMAIL' | 'SMS'; subject?: string; body: string }> = [
@@ -135,6 +140,9 @@ const SETTINGS: Array<{ key: string; value: unknown; description: string }> = [
   { key: 'emergency.public_number', value: '112', description: 'National emergency number shown first on every emergency screen.' },
   { key: 'emergency.live_dispatch_enabled', value: false, description: 'Live ambulance dispatch through partner operators. Off until operationally validated.' },
   { key: 'search.default_radius_km', value: 15, description: 'Default provider search radius.' },
+  { key: 'portal.ui', value: {}, description: 'Provider portal structure and copy overrides (section names, page copy, hidden pages, banner, support contacts). Empty = as shipped.' },
+  { key: 'portal.member_capabilities', value: {}, description: 'Provider staff role → capability overrides. Empty = as shipped; owners always hold everything.' },
+  { key: 'patient.ui', value: {}, description: 'Patient app content overrides (hero, landing, categories, banner, support, theme). Empty = as shipped.' },
 ];
 
 export async function seedReferenceData(db: PrismaClient): Promise<void> {
@@ -155,15 +163,22 @@ export async function seedReferenceData(db: PrismaClient): Promise<void> {
       update: { name: s.name, parentId: parent.id },
     });
   }
+  for (const sp of await db.speciality.findMany({ select: { id: true, code: true, synonyms: true } })) {
+    const merged = mergeTerms(sp.synonyms, SPECIALITY_TERMS[sp.code]);
+    if (merged.length !== sp.synonyms.length) await db.speciality.update({ where: { id: sp.id }, data: { synonyms: merged } });
+  }
   const specByCode = new Map((await db.speciality.findMany()).map((s) => [s.code, s.id]));
 
-  for (const c of CONDITIONS) {
+  for (const c of [...CONDITIONS, ...EXTRA_CONDITIONS]) {
     const slug = c.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
     const cond = await db.condition.upsert({
       where: { slug },
-      create: { name: c.name, slug, kind: c.kind ?? 'CONDITION', synonyms: c.synonyms ?? [], isRedFlag: c.redFlag ?? false },
-      update: { synonyms: c.synonyms ?? [], isRedFlag: c.redFlag ?? false, kind: c.kind ?? 'CONDITION' },
+      create: { name: c.name, slug, kind: c.kind ?? 'CONDITION', synonyms: mergeTerms(c.synonyms ?? [], CONDITION_TERMS[c.name]), isRedFlag: c.redFlag ?? false },
+      update: { isRedFlag: c.redFlag ?? false, kind: c.kind ?? 'CONDITION' },
     });
+    // Merge so words an admin added in the dashboard survive a re-seed.
+    const merged = mergeTerms(cond.synonyms, [...(c.synonyms ?? []), ...(CONDITION_TERMS[c.name] ?? [])]);
+    if (merged.length !== cond.synonyms.length) await db.condition.update({ where: { id: cond.id }, data: { synonyms: merged } });
     for (const [code, relevance] of c.map) {
       const specialityId = specByCode.get(code)!;
       await db.conditionSpecialityMapping.upsert({
@@ -200,7 +215,9 @@ export async function seedReferenceData(db: PrismaClient): Promise<void> {
       preparationInstructions: s.prep ?? null,
       requiresPrescription: s.rx ?? false,
     };
-    await db.service.upsert({ where: { code: s.code }, create: { code: s.code, ...data }, update: data });
+    const svc = await db.service.upsert({ where: { code: s.code }, create: { code: s.code, ...data, synonyms: mergeTerms([], SERVICE_TERMS[s.code]) }, update: data });
+    const merged = mergeTerms(svc.synonyms, SERVICE_TERMS[s.code]);
+    if (merged.length !== svc.synonyms.length) await db.service.update({ where: { id: svc.id }, data: { synonyms: merged } });
   }
 
   for (const t of TEMPLATES) {

@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from 'node:crypto';
-import { prisma, type Tx } from '../../lib/prisma.js';
+import { prisma, transactionWithRetry, type Tx } from '../../lib/prisma.js';
 import { env } from '../../config/env.js';
 import { AppError, badRequest, conflict, isPgError } from '../../lib/errors.js';
 import { randomToken, sha256Hex } from '../../lib/crypto.js';
@@ -123,14 +123,29 @@ export async function login(identifier: string, password: string, client: Client
 }
 
 /**
+ * How long a just-rotated refresh token is still accepted. Real patients hit
+ * this: the installed app and a browser tab refreshing together, or a reload
+ * landing while a refresh is in flight. Inside the window we issue another
+ * token in the same family instead of treating it as theft (the same "reuse
+ * interval" idea Auth0 and Okta use). Outside it, reuse still revokes everything.
+ */
+const REFRESH_REUSE_GRACE_MS = 30_000;
+
+/**
  * Refresh-token rotation. Each refresh token is single-use; presenting a token
- * that was already rotated indicates theft, so the whole session family is
- * revoked.
+ * that was rotated more than REFRESH_REUSE_GRACE_MS ago indicates theft, so
+ * the whole session family is revoked.
  */
 export async function refresh(refreshToken: string, client: ClientInfo) {
   const hash = sha256Hex(refreshToken);
   const session = await prisma.session.findUnique({ where: { refreshTokenHash: hash }, include: { user: true } });
   if (!session) throw new AppError(401, 'TOKEN_INVALID', 'Invalid refresh token');
+
+  const withinGrace = (at: Date | null) => !!at && Date.now() - at.getTime() < REFRESH_REUSE_GRACE_MS;
+  const userUsable = session.user.status === 'ACTIVE' || session.user.status === 'PENDING_VERIFICATION';
+  if (session.rotatedAt && !session.revokedAt && withinGrace(session.rotatedAt) && session.expiresAt > new Date() && userUsable) {
+    return prisma.$transaction((tx) => issueSession(tx, session.userId, client, session.familyId));
+  }
 
   if (session.rotatedAt) {
     // Reuse of an already-rotated token → assume theft and revoke the whole
@@ -158,7 +173,9 @@ export async function refresh(refreshToken: string, client: ClientInfo) {
     throw new AppError(403, 'ACCOUNT_INACTIVE', 'This account is not active');
   }
 
-  return prisma.$transaction(async (tx) => {
+  // Two concurrent refreshes of one token write the same session document; MongoDB aborts the second with a
+  // write conflict, and the retry then takes the "lost the race" branch below instead of surfacing a 409.
+  return transactionWithRetry(async (tx) => {
     // Conditional update guards against two concurrent refreshes of one token.
     // The rotated session stays un-revoked so its (≤15 min) access token keeps
     // working, but its refresh token can never be used again.
@@ -166,7 +183,12 @@ export async function refresh(refreshToken: string, client: ClientInfo) {
       where: { id: session.id, rotatedAt: null, revokedAt: null },
       data: { rotatedAt: new Date(), lastUsedAt: new Date() },
     });
-    if (rotated.count !== 1) throw new AppError(401, 'TOKEN_INVALID', 'Refresh token is no longer valid');
+    if (rotated.count !== 1) {
+      // Lost a race with a concurrent refresh of this token a moment ago (two tabs). Same family, fresh token,
+      // unless the session was revoked in the meantime (logout, password change).
+      const now = await tx.session.findUnique({ where: { id: session.id }, select: { revokedAt: true } });
+      if (!now || now.revokedAt) throw new AppError(401, 'TOKEN_INVALID', 'Refresh token is no longer valid');
+    }
     return issueSession(tx, session.userId, client, session.familyId);
   });
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../helpers/factory.js';
 import { clearPincodeCache, lookupPincode } from '../../src/modules/geo/geo.service.js';
+import { clearGeocoderCache } from '../../src/modules/geo/geocoder.js';
 
 const indiaPost = (offices: object[], status = 'Success') => [{ Message: 'synthetic', Status: status, PostOffice: offices.length ? offices : null }];
 const office = (over: Partial<Record<string, string | null>> = {}) => ({ Name: 'Moyna', BranchType: 'Sub Post Office', DeliveryStatus: 'Delivery', Circle: 'West Bengal', District: 'East Midnapore', Division: 'Tamluk', Region: 'South Bengal', Block: 'Moyna', State: 'West Bengal', Country: 'India', Pincode: '721629', ...over });
@@ -55,5 +56,46 @@ describe('reference geography (public, no login)', () => {
     const down = await api().get('/api/v1/public/geo/pincode/400001');
     expect(down.status).toBe(503);
     expect(down.body.error.code).toBe('SERVICE_UNAVAILABLE');
+  });
+});
+
+describe('place search and reverse geocoding (proxied geocoder, public)', () => {
+  const osm = (over: Record<string, unknown> = {}) => ({
+    lat: '22.2896', lon: '87.9183', display_name: 'Tamluk, Purba Medinipur, West Bengal, 721636, India',
+    address: { road: 'Hospital Road', suburb: 'Abasbari', town: 'Tamluk', state_district: 'Purba Medinipur District', state: 'West Bengal', postcode: '721636' },
+    ...over,
+  });
+  const respond = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  afterEach(() => { vi.unstubAllGlobals(); clearGeocoderCache(); });
+
+  it('searches places in India with the injected fetch, biased to the caller, and maps the address', async () => {
+    const fetchMock = vi.fn(async () => respond([osm()]));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await api().get('/api/v1/public/geo/search?q=Tamluk%20hospital&lat=22.3&lng=87.9&limit=3');
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.data).toHaveLength(1);
+    expect(r.body.data[0]).toMatchObject({ label: expect.stringContaining('Tamluk'), latitude: 22.2896, longitude: 87.9183, address: { addressLine1: 'Hospital Road', locality: 'Abasbari', city: 'Tamluk', district: 'Purba Medinipur', state: 'West Bengal', pincode: '721636' } });
+    const [calledUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const url = new URL(calledUrl);
+    expect(url.searchParams.get('countrycodes')).toBe('in');
+    expect(url.searchParams.get('limit')).toBe('3');
+    expect(url.searchParams.get('viewbox')).toBeTruthy();
+    expect((await api().get('/api/v1/public/geo/search?q=ab')).status).toBe(400); // q must be at least 3 chars
+  });
+
+  it('reverse-geocodes a point, returns null when nothing is there, and 503 when the geocoder is down', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => respond(osm())));
+    const hit = await api().get('/api/v1/public/geo/reverse?lat=22.2896&lng=87.9183');
+    expect(hit.status).toBe(200);
+    expect(hit.body.data).toMatchObject({ address: { city: 'Tamluk', pincode: '721636' } });
+    vi.stubGlobal('fetch', vi.fn(async () => respond({ error: 'Unable to geocode' })));
+    const none = await api().get('/api/v1/public/geo/reverse?lat=0.5&lng=0.5');
+    expect(none.status).toBe(200);
+    expect(none.body.data).toBeNull();
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ETIMEDOUT'); }));
+    const down = await api().get('/api/v1/public/geo/reverse?lat=22.1&lng=88.1');
+    expect(down.status).toBe(503);
+    expect(down.body.error.message).toBe('Place search is unavailable right now');
+    expect((await api().get('/api/v1/public/geo/reverse?lat=95&lng=10')).status).toBe(400);
   });
 });
