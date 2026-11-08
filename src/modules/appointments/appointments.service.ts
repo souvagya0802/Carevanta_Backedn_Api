@@ -1,4 +1,4 @@
-import { notifyProviderStaff, notifyUsers } from '../notifications/events.js';
+import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
 import { prisma, transactionWithRetry, type Tx } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { AppError, badRequest, conflict, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
@@ -188,6 +188,8 @@ async function bookInTx(tx: Tx, input: BookingInput) {
   // The front desk hears about it at once: everyone at the facility who manages bookings (the doctor themselves at their own chamber).
   await notifyProviderStaff(tx, slot.location.providerId, 'manage_bookings', {
     key: 'portal.appointment_booked',
+    level: input.source === 'WALK_IN' ? 'light' : 'important',
+    meta: { kind: 'appointment', id: appt.id, providerId: slot.location.providerId, status },
     title: input.source === 'WALK_IN' ? 'Walk-in recorded' : status === 'CONFIRMED' ? 'New appointment' : 'New appointment request',
     body: `${patient.fullName} · ${slot.doctor.displayName} · ${formatIst(slot.startsAt)}`,
     link: `/appointments?id=${appt.id}`,
@@ -294,6 +296,18 @@ export async function act(
     }
     // Tell the patient in the app (and by push when enabled) whenever someone else changes the booking.
     if (actor.kind !== 'PATIENT') await notifyPatientOfChange(tx, a, to, reason);
+    // The front desk hears when the patient cancels (staff see it live, so the slot can be reused).
+    else if (to === 'CANCELLED_BY_PATIENT') {
+      await notifyProviderStaff(tx, a.facilityProviderId, 'manage_bookings', {
+        key: 'portal.appointment_cancelled_by_patient',
+        title: 'Appointment cancelled by the patient',
+        body: `${holder.fullName} · ${formatIst(a.slot.startsAt)} (${a.reference})${reason ? ` · ${reason}` : ''}`,
+        link: `/appointments?id=${id}`,
+        level: 'important',
+        meta: { kind: 'appointment', id, providerId: a.facilityProviderId, status: to },
+        exceptUserId: actor.userId,
+      });
+    }
     await audit(tx, { action: `appointment.${action.toLowerCase()}`, entityType: 'appointment', entityId: id, actorUserId: actor.userId, metadata: { from: a.status, to, refundRequestedMinor: refundRequestedMinor.toString() } });
     return { refundRequestedMinor: Number(refundRequestedMinor) };
   });
@@ -314,19 +328,19 @@ async function notifyPatientOfChange(
   const who = doctor?.displayName ?? 'your doctor';
   const when = formatIst(a.slot.startsAt);
   const why = reason ? ` Reason: ${reason}` : '';
-  const messages: Partial<Record<AppointmentStatus | 'RESCHEDULED', { title: string; body: string; urgent?: boolean }>> = {
-    CONFIRMED: { title: 'Appointment confirmed', body: `Your visit with ${who} on ${when} is confirmed (${a.reference}).` },
-    REJECTED: { title: 'Appointment not accepted', body: `${who} could not accept the booking for ${when}.${why} Any payment will be refunded.`, urgent: true },
-    CANCELLED_BY_PROVIDER: { title: 'Appointment cancelled by the clinic', body: `Your visit with ${who} on ${when} was cancelled.${why} Any payment will be refunded.`, urgent: true },
-    CANCELLED_BY_PLATFORM: { title: 'Appointment cancelled', body: `Your visit with ${who} on ${when} was cancelled by Carevanta support.${why} Any payment will be refunded.`, urgent: true },
-    CHECKED_IN: { title: 'You are checked in', body: `Checked in for ${who}. Please wait to be called.` },
-    COMPLETED: { title: 'Visit completed', body: `Your visit with ${who} is complete. Tell others how it went: rate this visit.` },
-    NO_SHOW: { title: 'Missed appointment', body: `You were marked as not attending the visit with ${who} on ${when}.` },
-    RESCHEDULED: { title: 'Appointment moved', body: `Your visit with ${who} is now on ${when} (${a.reference}).`, urgent: true },
+  const messages: Partial<Record<AppointmentStatus | 'RESCHEDULED', { title: string; body: string; level: NoticeLevel }>> = {
+    CONFIRMED: { title: 'Appointment confirmed', body: `Your visit with ${who} on ${when} is confirmed (${a.reference}).`, level: 'important' },
+    REJECTED: { title: 'Appointment not accepted', body: `${who} could not accept the booking for ${when}.${why} Any payment will be refunded.`, level: 'important' },
+    CANCELLED_BY_PROVIDER: { title: 'Appointment cancelled by the clinic', body: `Your visit with ${who} on ${when} was cancelled.${why} Any payment will be refunded.`, level: 'important' },
+    CANCELLED_BY_PLATFORM: { title: 'Appointment cancelled', body: `Your visit with ${who} on ${when} was cancelled by Carevanta support.${why} Any payment will be refunded.`, level: 'important' },
+    CHECKED_IN: { title: 'You are checked in', body: `Checked in for ${who}. Please wait to be called.`, level: 'light' },
+    COMPLETED: { title: 'Visit completed', body: `Your visit with ${who} is complete. Tell others how it went: rate this visit.`, level: 'light' },
+    NO_SHOW: { title: 'Missed appointment', body: `You were marked as not attending the visit with ${who} on ${when}.`, level: 'light' },
+    RESCHEDULED: { title: 'Appointment moved', body: `Your visit with ${who} is now on ${when} (${a.reference}).`, level: 'important' },
   };
   const m = messages[to];
   if (!m) return;
-  await notifyUsers(tx, [holder.accountUserId], { key: `appointment.${to.toLowerCase()}`, title: m.title, body: m.body, link: `/appointments/${a.id}`, urgent: m.urgent });
+  await notifyUsers(tx, [holder.accountUserId], { key: `appointment.${to.toLowerCase()}`, title: m.title, body: m.body, link: `/appointments/${a.id}`, level: m.level, meta: { kind: 'appointment', id: a.id, providerId: a.doctorProviderId, status: to } });
 }
 
 /**
@@ -369,6 +383,17 @@ export async function reschedule(id: string, newSlotId: string, actor: { userId:
       }
       await audit(tx, { action: 'appointment.rescheduled', entityType: 'appointment', entityId: id, actorUserId: actor.userId, metadata: { newAppointmentId: newId, newSlotId } });
       if (actor.kind !== 'PATIENT') await notifyPatientOfChange(tx, { ...a, id: newId, slot: newSlot }, 'RESCHEDULED');
+      else {
+        await notifyProviderStaff(tx, a.facilityProviderId, 'manage_bookings', {
+          key: 'portal.appointment_rescheduled_by_patient',
+          title: 'Appointment moved by the patient',
+          body: `${a.reference} is now on ${formatIst(newSlot.startsAt)}`,
+          link: `/appointments?id=${newId}`,
+          level: 'important',
+          meta: { kind: 'appointment', id: newId, providerId: a.facilityProviderId, status: 'RESCHEDULED' },
+          exceptUserId: actor.userId,
+        });
+      }
       return newId;
     });
   } catch (err) {

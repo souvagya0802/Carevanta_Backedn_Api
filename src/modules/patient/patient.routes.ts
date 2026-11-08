@@ -7,6 +7,7 @@
  */
 import express, { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
+import { notifyUsersWithPermission } from '../notifications/events.js';
 import { defineRoute } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
 import { aggregate, boundingBox, distanceKmExpr, ejsonDate, istDayStart, num } from '../../lib/mongo.js';
@@ -715,6 +716,7 @@ export function patientRouter(): Router {
       if (await prisma.review.findUnique({ where: { appointmentId: a.id } })) throw conflict('You already reviewed this visit');
       const review = await prisma.review.create({ data: { providerId: a.facilityProviderId, authorUserId: auth.userId, appointmentId: a.id, rating: body.rating, comment: body.comment ?? null } });
       await audit(prisma, { action: 'review.submitted', entityType: 'review', entityId: review.id, actorUserId: auth.userId, metadata: { rating: body.rating } });
+      await notifyUsersWithPermission(prisma, 'reviews.moderate', { key: 'admin.review_pending', title: 'Review waiting for moderation', body: `${body.rating}★ review submitted for a completed visit`, link: '/reviews', level: 'light', meta: { kind: 'review', id: review.id, providerId: a.facilityProviderId, status: review.status } });
       return { id: review.id, status: review.status, rating: review.rating };
     },
   });

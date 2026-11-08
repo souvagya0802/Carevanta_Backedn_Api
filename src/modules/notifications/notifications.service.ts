@@ -104,7 +104,7 @@ export function smsSegments(text: string): { encoding: 'GSM-7' | 'UCS-2'; length
  * without printing the secret contents. Wire an Indian DLT-registered SMS
  * gateway here for SMS.
  */
-async function send(n: { channel: NotificationChannel; recipient: string; subject?: string | null; body: string; link?: string | null; urgent?: boolean }) {
+async function send(n: { channel: NotificationChannel; recipient: string; subject?: string | null; body: string; link?: string | null; urgent?: boolean; level?: string }) {
   if (n.channel === 'EMAIL' && (await getSmtpConfig())) {
     const { messageId } = await sendEmail(n.recipient, n.subject ?? 'Carevanta', n.body);
     logger.info({ channel: n.channel, to: maskRecipient(n.recipient), messageId }, 'email sent via SMTP');
@@ -112,7 +112,7 @@ async function send(n: { channel: NotificationChannel; recipient: string; subjec
   }
   if (n.channel === 'PUSH' && (await getPushConfig())) {
     // For push the recipient is the user id; every subscribed device of theirs gets it.
-    const accepted = await sendPushToUser(n.recipient, { title: n.subject ?? 'Carevanta', body: n.body, link: n.link, urgent: n.urgent });
+    const accepted = await sendPushToUser(n.recipient, { title: n.subject ?? 'Carevanta', body: n.body, link: n.link, urgent: n.urgent, level: n.level });
     logger.info({ channel: n.channel, userId: n.recipient, accepted }, 'push sent');
     return;
   }
@@ -163,6 +163,7 @@ export async function deliverQueuedNotifications(batchSize = 50): Promise<number
       if (templated && !template) throw new Error(`No active template ${n.templateKey}/${n.channel}`);
       const vars = decryptNotificationPayload(n.payload);
       const raw = (n.payload as { urgent?: unknown } | null)?.urgent === true;
+      const level = (n.payload as { level?: unknown } | null)?.level;
       await send({
         channel: n.channel,
         recipient: n.recipient,
@@ -170,6 +171,7 @@ export async function deliverQueuedNotifications(batchSize = 50): Promise<number
         body: template ? render(template.body, vars) : (n.body ?? ''),
         link: n.link,
         urgent: raw,
+        level: typeof level === 'string' ? level : undefined,
       });
       // Once delivered, the secret payload is no longer needed — drop it.
       await prisma.notification.update({ where: { id }, data: { status: 'SENT', sentAt: new Date(), payload: {} } });

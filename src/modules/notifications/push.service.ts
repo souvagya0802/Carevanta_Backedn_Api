@@ -80,7 +80,7 @@ export async function unsubscribe(userId: string, endpoint: string) {
 
 export const hasPushSubscription = async (db: Db, userId: string) => (await db.pushSubscription.count({ where: { userId } })) > 0;
 
-export interface PushPayload { title: string; body: string; link?: string | null; tag?: string; urgent?: boolean }
+export interface PushPayload { title: string; body: string; link?: string | null; tag?: string; urgent?: boolean; level?: string }
 
 /** Sends to every device of a user; dead endpoints are removed. Returns how many pushes the services accepted. */
 export async function sendPushToUser(userId: string, payload: PushPayload): Promise<number> {
@@ -89,7 +89,7 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
   const subs = await prisma.pushSubscription.findMany({ where: { userId } });
   if (!subs.length) throw new Error('User has no push subscriptions');
   let accepted = 0;
-  const body = JSON.stringify({ title: payload.title, body: payload.body, link: payload.link ?? '/', tag: payload.tag ?? payload.link ?? 'carevanta', urgent: !!payload.urgent });
+  const body = JSON.stringify({ title: payload.title, body: payload.body, link: payload.link ?? '/', tag: payload.tag ?? payload.link ?? 'carevanta', urgent: !!payload.urgent, level: payload.level ?? (payload.urgent ? 'important' : 'light') });
   for (const s of subs) {
     try {
       await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, {

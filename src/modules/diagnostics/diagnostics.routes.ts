@@ -1,8 +1,9 @@
-import { notifyProviderStaff, notifyUsers } from '../notifications/events.js';
+import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
 import express, { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
-import { prisma } from '../../lib/prisma.js';
+import { prisma, type Tx } from '../../lib/prisma.js';
+import { formatIst } from '../../lib/time.js';
 import { audit, logSensitiveAccess } from '../../lib/audit.js';
 import { badRequest, conflict, notFound, preconditionFailed } from '../../lib/errors.js';
 import { assertTransition, type TransitionMap } from '../../lib/state-machine.js';
@@ -86,6 +87,10 @@ export async function scheduleDiagnosticOrder(providerId: string, orderId: strin
   if (when.getTime() < Date.now() - 60_000) throw badRequest('The time must be in the future');
   await prisma.diagnosticOrder.update({ where: { id: orderId }, data: { scheduledAt: when, version: { increment: 1 } } });
   await audit(prisma, { action: 'diagnostic_order.scheduled', entityType: 'diagnostic_order', entityId: orderId, actorUserId, metadata: { scheduledAt: when.toISOString() } });
+  const scheduled = await prisma.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, collectionMode: true, patient: { select: { accountUserId: true } } } });
+  if (scheduled) {
+    await notifyUsers(prisma, [scheduled.patient.accountUserId], { key: 'diagnostic_order.scheduled', title: scheduled.collectionMode === 'HOME_COLLECTION' ? 'Sample collection time set' : 'Lab visit time set', body: `Order ${scheduled.reference} · ${formatIst(when)}`, link: `/orders/lab/${orderId}`, level: 'light', meta: { kind: 'diagnostic_order', id: orderId, providerId, status: 'CONFIRMED' } });
+  }
 }
 
 export async function createDiagnosticOrder(input: {
@@ -139,7 +144,7 @@ export async function createDiagnosticOrder(input: {
     });
     await createTransaction(tx, { sourceType: 'DIAGNOSTIC_ORDER', sourceId: order.id, providerId: provider.id, patientProfileId: input.patientProfileId, grossMinor: total, attribution: input.attribution, payAtProvider: true });
     await audit(tx, { action: 'diagnostic_order.created', entityType: 'diagnostic_order', entityId: order.id, actorUserId: input.actorUserId, metadata: { tests: offerings.length, collectionMode: input.collectionMode } });
-    await notifyProviderStaff(tx, provider.id, 'manage_bookings', { key: 'portal.diagnostic_order_placed', title: 'New test order', body: `${order.reference} · ${offerings.length} test(s) · ${input.collectionMode === 'HOME_COLLECTION' ? 'home collection' : 'centre visit'}`, link: `/diagnostic-orders?id=${order.id}` });
+    await notifyProviderStaff(tx, provider.id, 'manage_bookings', { key: 'portal.diagnostic_order_placed', level: 'important', meta: { kind: 'diagnostic_order', id: order.id, providerId: provider.id, status: 'REQUESTED' }, title: 'New test order', body: `${order.reference} · ${offerings.length} test(s) · ${input.collectionMode === 'HOME_COLLECTION' ? 'home collection' : 'centre visit'}`, link: `/diagnostic-orders?id=${order.id}` });
     return order.id;
   });
 }
@@ -159,7 +164,32 @@ export async function diagnosticAction(id: string, to: DiagnosticOrderStatus, ac
     if ((to === 'CANCELLED' || to === 'REJECTED') && o.transaction) await onSourceCancelled(tx, o.transaction.id, actorUserId, reason!);
     if (to === 'COMPLETED' && o.transaction) await onServiceCompleted(tx, o.transaction.id, actorUserId);
     await audit(tx, { action: `diagnostic_order.${to.toLowerCase()}`, entityType: 'diagnostic_order', entityId: id, actorUserId, metadata: { from: o.status, to } });
+    await notifyDiagnosticChange(tx, id, to, actorUserId, reason);
   });
+}
+
+const DX_PATIENT_MESSAGES: Partial<Record<DiagnosticOrderStatus, { title: string; body: (ref: string) => string; level: NoticeLevel }>> = {
+  CONFIRMED: { title: 'Test order confirmed', body: (ref) => `Order ${ref} is confirmed by the lab.`, level: 'light' },
+  SAMPLE_COLLECTED: { title: 'Sample collected', body: (ref) => `Your sample for order ${ref} has been collected.`, level: 'light' },
+  REJECTED: { title: 'Test order not accepted', body: (ref) => `The lab could not accept order ${ref}.`, level: 'important' },
+  CANCELLED: { title: 'Test order cancelled by the lab', body: (ref) => `Order ${ref} was cancelled.`, level: 'important' },
+};
+
+/** Patient hears about lab-side changes; lab staff hear when the patient cancels. */
+async function notifyDiagnosticChange(tx: Tx, orderId: string, to: DiagnosticOrderStatus, actorUserId: string, reason?: string) {
+  const o = await tx.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, providerId: true, patient: { select: { accountUserId: true, fullName: true } } } });
+  if (!o) return;
+  const meta = { kind: 'diagnostic_order' as const, id: orderId, providerId: o.providerId, status: to };
+  if (actorUserId === o.patient.accountUserId) {
+    if (to === 'CANCELLED') {
+      await notifyProviderStaff(tx, o.providerId, 'manage_bookings', { key: 'portal.diagnostic_order_cancelled', title: 'Test order cancelled by the patient', body: `${o.reference} · ${o.patient.fullName}${reason ? ` · ${reason}` : ''}`, link: `/orders?id=${orderId}`, level: 'important', meta, exceptUserId: actorUserId });
+    }
+    return;
+  }
+  const m = DX_PATIENT_MESSAGES[to];
+  if (!m) return;
+  const why = m.level === 'important' && reason ? ` Reason: ${reason}` : '';
+  await notifyUsers(tx, [o.patient.accountUserId], { key: `diagnostic_order.${to.toLowerCase()}`, title: m.title, body: `${m.body(o.reference)}${why}`, link: `/orders/lab/${orderId}`, level: m.level, meta });
 }
 
 /** Publish a report version. Corrections create v+1 and keep prior versions. */
@@ -187,7 +217,7 @@ export async function publishReport(auth: AuthContext, orderId: string, file: Bu
     });
     await audit(tx, { action: previous ? 'diagnostic_report.corrected' : 'diagnostic_report.published', entityType: 'diagnostic_order', entityId: orderId, metadata: { reportId: report.id, version: report.version } });
     const o = await tx.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, patient: { select: { accountUserId: true } } } });
-    if (o) await notifyUsers(tx, [o.patient.accountUserId], { key: 'patient.report_published', title: previous ? 'Your report was corrected' : 'Your report is ready', body: `Order ${o.reference}`, link: `/orders/${orderId}` });
+    if (o) await notifyUsers(tx, [o.patient.accountUserId], { key: 'patient.report_published', title: previous ? 'Your report was corrected' : 'Your report is ready', body: `Order ${o.reference}`, link: `/orders/lab/${orderId}`, level: 'important', meta: { kind: 'diagnostic_order', id: orderId, providerId: order.providerId, status: 'REPORT_READY' } });
     return report;
   });
 }

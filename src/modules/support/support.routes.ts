@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { notifyUsersWithPermission } from '../notifications/events.js';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
@@ -262,6 +263,7 @@ export function supportRouter(): Router {
           },
         });
         await tx.supportCaseEvent.create({ data: { caseId: c.id, authorId: auth.userId, kind: 'STATUS_CHANGE', body: 'Case opened', metadata: { to: 'OPEN' } } });
+        await notifyUsersWithPermission(tx, 'support.manage', { key: 'admin.support_case_opened', title: `New support case · ${c.reference}`, body: `${c.subject} · ${String(c.priority).toLowerCase()} priority`, link: `/support?id=${c.id}`, level: 'important', meta: { kind: 'support_case', id: c.id, status: 'OPEN' }, exceptUserId: auth.userId });
         await audit(tx, { action: 'support_case.opened', entityType: 'support_case', entityId: c.id, metadata: { type: body.type, priority: body.priority } });
         return c.id;
       });

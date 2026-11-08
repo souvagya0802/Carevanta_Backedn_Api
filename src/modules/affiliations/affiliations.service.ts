@@ -163,9 +163,9 @@ async function createAffiliation(
       await audit(tx, { action: 'affiliation.created', entityType: 'affiliation', entityId: a.id, metadata: { kind, doctorProviderId, facilityProviderId } });
       if (kind === 'FACILITY') {
         const dp = await tx.doctorProfile.findUnique({ where: { providerId: doctorProviderId }, select: { userId: true } });
-        if (dp) await notifyUsers(tx, [dp.userId], { key: 'portal.affiliation_invited', title: 'A hospital or clinic invited you', body: 'Open Hospitals & Clinics to accept or decline', link: '/affiliations', exceptUserId: actor.userId });
+        if (dp) await notifyUsers(tx, [dp.userId], { key: 'portal.affiliation_invited', title: 'A hospital or clinic invited you', body: 'Open Hospitals & Clinics to accept or decline', link: '/affiliations', level: 'important', meta: { kind: 'affiliation', id: a.id, providerId: facilityProviderId, status }, exceptUserId: actor.userId });
       } else if (kind === 'DOCTOR') {
-        await notifyProviderStaff(tx, facilityProviderId, 'manage_affiliations', { key: 'portal.affiliation_requested', title: 'A doctor asked to join', body: 'Open Doctors to accept or decline', link: '/affiliations', exceptUserId: actor.userId });
+        await notifyProviderStaff(tx, facilityProviderId, 'manage_affiliations', { key: 'portal.affiliation_requested', title: 'A doctor asked to join', body: 'Open Doctors to accept or decline', link: '/affiliations', level: 'important', meta: { kind: 'affiliation', id: a.id, providerId: facilityProviderId, status }, exceptUserId: actor.userId });
       }
       return a.id;
     });
@@ -282,6 +282,17 @@ export async function transition(
       affectedAppointments = await tx.appointment.count({ where: { affiliationId: id, status: { in: ['REQUESTED', 'CONFIRMED'] }, slot: { startsAt: { gt: now } } } });
     } else if (to === 'ACTIVE' && a.status === 'SUSPENDED') {
       await tx.appointmentSlot.updateMany({ where: { affiliationId: id, status: 'BLOCKED', startsAt: { gt: now } }, data: { status: 'OPEN' } });
+    }
+    // The other party hears the answer to an invitation or request.
+    if (action === 'ACCEPT' || action === 'DECLINE') {
+      const accepted = action === 'ACCEPT';
+      const meta = { kind: 'affiliation' as const, id, providerId: a.facilityProviderId, status: to };
+      if (side === 'DOCTOR') {
+        await notifyProviderStaff(tx, a.facilityProviderId, 'manage_affiliations', { key: `portal.affiliation_${accepted ? 'accepted' : 'declined'}`, title: accepted ? 'Doctor accepted your invitation' : 'Doctor declined your invitation', body: accepted ? 'Verification by Carevanta comes next.' : (note ?? 'No reason given.'), link: '/affiliations', level: 'light', meta, exceptUserId: actor.userId });
+      } else if (side === 'FACILITY') {
+        const dp = await tx.doctorProfile.findUnique({ where: { providerId: a.doctorProviderId }, select: { userId: true } });
+        if (dp) await notifyUsers(tx, [dp.userId], { key: `portal.affiliation_${accepted ? 'accepted' : 'declined'}`, title: accepted ? 'Your request was accepted' : 'Your request was declined', body: accepted ? 'Verification by Carevanta comes next.' : (note ?? 'No reason given.'), link: '/affiliations', level: 'light', meta, exceptUserId: actor.userId });
+      }
     }
     await audit(tx, { action: `affiliation.${action.toLowerCase()}`, entityType: 'affiliation', entityId: id, metadata: { from: a.status, to, side, affectedAppointments } });
     return { affectedAppointments };

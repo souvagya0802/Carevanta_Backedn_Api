@@ -1,4 +1,6 @@
 import express, { Router, type Request, type Response } from 'express';
+import { noticeFields } from '../notifications/events.js';
+import { notificationStreamHandler } from '../notifications/stream.js';
 import { z } from 'zod';
 import { defineRoute } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
@@ -117,6 +119,9 @@ export function portalRouter(): Router {
     handler: async () => ({ ...(await uiDto()), catalogue: { types: [...PORTAL_TYPES], pages: PORTAL_PAGES, words: DEFAULT_WORDS }, roles: Object.fromEntries(Object.entries(await memberCapabilityMatrix()).map(([k, v]) => [k, [...v]])) }),
   });
 
+  // Live notifications (SSE). A plain handler: defineRoute's JSON envelope does not fit a long-lived event stream.
+  r.get('/portal/notifications/stream', authenticate, notificationStreamHandler);
+
   defineRoute(r, '/portal', {
     kind: 'list',
     method: 'get',
@@ -128,7 +133,7 @@ export function portalRouter(): Router {
     handler: async ({ query, auth }) => {
       const rows = await prisma.notification.findMany({ where: { userId: auth.userId, ...(query.channel ? { channel: query.channel } : {}), ...(query.unread ? { channel: 'IN_APP', readAt: null } : {}), ...cursorWhere(query.cursor) }, orderBy: cursorOrderBy(), take: query.limit + 1 });
       const { items, page } = buildPage(rows, query.limit, (n) => n.createdAt);
-      return { page, items: items.map((n) => ({ id: n.id, channel: n.channel, templateKey: n.templateKey, status: n.status, title: n.title, body: n.body, link: n.link, readAt: iso(n.readAt), sentAt: iso(n.sentAt), createdAt: n.createdAt.toISOString() })) };
+      return { page, items: items.map((n) => ({ id: n.id, channel: n.channel, templateKey: n.templateKey, ...noticeFields(n.payload), status: n.status, title: n.title, body: n.body, link: n.link, readAt: iso(n.readAt), sentAt: iso(n.sentAt), createdAt: n.createdAt.toISOString() })) };
     },
   });
 

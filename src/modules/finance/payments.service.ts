@@ -1,4 +1,5 @@
 import { prisma, transactionWithRetry, lockTransaction } from '../../lib/prisma.js';
+import { notifyUsersWithPermission } from '../notifications/events.js';
 import { audit } from '../../lib/audit.js';
 import { AppError, badRequest, conflict, notFound, separationOfDuties } from '../../lib/errors.js';
 import { sha256Hex } from '../../lib/crypto.js';
@@ -247,6 +248,7 @@ export async function requestRefund(actor: AuthContext, input: { transactionId: 
       },
     });
     await audit(tx, { action: 'refund.requested', entityType: 'refund', entityId: refund.id, metadata: { amountMinor: input.amountMinor.toString(), transactionId: txn.id } });
+    await notifyUsersWithPermission(tx, 'finance.refunds.approve', { key: 'admin.refund_requested', title: `Refund awaiting approval · ${refund.reference}`, body: `₹${(Number(input.amountMinor) / 100).toFixed(2)} on ${txn.reference}`, link: `/payments?tab=refunds&id=${refund.id}`, level: 'important', meta: { kind: 'refund', id: refund.id, providerId: txn.providerId, status: 'REQUESTED' }, exceptUserId: actor.userId });
     return refund;
   });
 }

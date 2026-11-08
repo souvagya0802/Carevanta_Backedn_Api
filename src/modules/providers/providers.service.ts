@@ -1,4 +1,5 @@
 import { prisma, type Tx } from '../../lib/prisma.js';
+import { notifyUsersWithPermission } from '../notifications/events.js';
 import { audit } from '../../lib/audit.js';
 import { AppError, badRequest, conflict, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
 import { assertTransition } from '../../lib/state-machine.js';
@@ -545,6 +546,7 @@ export async function submitProvider(actor: AuthContext, providerId: string) {
       if (open.status === 'AWAITING_PROVIDER') await tx.verificationCase.update({ where: { id: open.id }, data: { status: 'OPEN' } });
       return;
     }
+    await notifyUsersWithPermission(tx, 'providers.verify', { key: 'admin.application_submitted', title: `${p.displayName} submitted for verification`, body: `${p.type.replace(/_/g, ' ').toLowerCase()} · ${p.approvedAt ? 'change request' : 'new application'}`, link: `/applications/${providerId}`, level: 'important', meta: { kind: 'application', id: providerId, providerId, status: 'SUBMITTED' }, exceptUserId: actor.userId });
     const reqs = VERIFICATION_REQUIREMENTS[p.type];
     await tx.verificationCase.create({
       data: {

@@ -1,4 +1,4 @@
-import { notifyProviderStaff } from '../notifications/events.js';
+import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -158,7 +158,34 @@ export async function advancePharmacyOrder(id: string, to: PharmacyOrderStatus, 
     if (RELEASES_STOCK.includes(to) && o.transaction) await onSourceCancelled(tx, o.transaction.id, actorUserId, reason!);
     if (to === 'DELIVERED' && o.transaction) await onServiceCompleted(tx, o.transaction.id, actorUserId);
     await audit(tx, { action: `pharmacy_order.${to.toLowerCase()}`, entityType: 'pharmacy_order', entityId: id, actorUserId, metadata: { from: o.status, to } });
+    await notifyPharmacyChange(tx, id, to, actorUserId, reason);
   });
+}
+
+const RX_PATIENT_MESSAGES: Partial<Record<PharmacyOrderStatus, { title: string; body: (ref: string) => string; level: NoticeLevel }>> = {
+  ACCEPTED: { title: 'Medicine order accepted', body: (ref) => `Order ${ref} is accepted and being prepared.`, level: 'light' },
+  READY_FOR_PICKUP: { title: 'Ready for pickup', body: (ref) => `Order ${ref} is ready at the pharmacy.`, level: 'light' },
+  OUT_FOR_DELIVERY: { title: 'Out for delivery', body: (ref) => `Order ${ref} is on its way.`, level: 'important' },
+  DELIVERED: { title: 'Medicines delivered', body: (ref) => `Order ${ref} has been delivered.`, level: 'light' },
+  REJECTED: { title: 'Medicine order not accepted', body: (ref) => `The pharmacy could not accept order ${ref}.`, level: 'important' },
+  CANCELLED: { title: 'Medicine order cancelled by the pharmacy', body: (ref) => `Order ${ref} was cancelled.`, level: 'important' },
+};
+
+/** Patient hears about pharmacy-side changes; pharmacy staff hear when the patient cancels. */
+async function notifyPharmacyChange(tx: Tx, orderId: string, to: PharmacyOrderStatus, actorUserId: string, reason?: string) {
+  const o = await tx.pharmacyOrder.findUnique({ where: { id: orderId }, select: { reference: true, providerId: true, patient: { select: { accountUserId: true, fullName: true } } } });
+  if (!o) return;
+  const meta = { kind: 'pharmacy_order' as const, id: orderId, providerId: o.providerId, status: to };
+  if (actorUserId === o.patient.accountUserId) {
+    if (to === 'CANCELLED') {
+      await notifyProviderStaff(tx, o.providerId, 'manage_bookings', { key: 'portal.pharmacy_order_cancelled', title: 'Medicine order cancelled by the patient', body: `${o.reference} · ${o.patient.fullName}${reason ? ` · ${reason}` : ''}`, link: `/orders?id=${orderId}`, level: 'important', meta, exceptUserId: actorUserId });
+    }
+    return;
+  }
+  const m = RX_PATIENT_MESSAGES[to];
+  if (!m) return;
+  const why = m.level === 'important' && reason ? ` Reason: ${reason}` : '';
+  await notifyUsers(tx, [o.patient.accountUserId], { key: `pharmacy_order.${to.toLowerCase()}`, title: m.title, body: `${m.body(o.reference)}${why}`, link: `/orders/medicine/${orderId}`, level: m.level, meta });
 }
 
 /**
@@ -255,7 +282,7 @@ export async function createPharmacyOrder(input: {
     });
     await createTransaction(tx, { sourceType: 'PHARMACY_ORDER', sourceId: order.id, providerId: pharmacy.id, patientProfileId: patient.id, grossMinor: total, attribution: input.attribution, payAtProvider: input.payAtProvider });
     await audit(tx, { action: 'pharmacy_order.created', entityType: 'pharmacy_order', entityId: order.id, actorUserId: input.actorUserId, metadata: { lines: lines.length, needsRx } });
-    await notifyProviderStaff(tx, pharmacy.id, 'manage_bookings', { key: 'portal.pharmacy_order_placed', title: needsRx ? 'New order — prescription to review' : 'New medicine order', body: `${order.reference} · ${patient.fullName} · ${lines.length} item(s)`, link: `/pharmacy-orders?id=${order.id}` });
+    await notifyProviderStaff(tx, pharmacy.id, 'manage_bookings', { key: 'portal.pharmacy_order_placed', level: 'important', meta: { kind: 'pharmacy_order', id: order.id, providerId: pharmacy.id, status: order.status }, title: needsRx ? 'New order — prescription to review' : 'New medicine order', body: `${order.reference} · ${patient.fullName} · ${lines.length} item(s)`, link: `/pharmacy-orders?id=${order.id}` });
     return order.id;
   });
 }
@@ -402,6 +429,17 @@ export function pharmacyRouter(): Router {
         data: { reviewStatus: body.decision, reviewNote: body.note, reviewedByUserId: auth.userId, reviewedAt: new Date(), validUntil: body.validUntil ? new Date(body.validUntil) : undefined },
       });
       await audit(prisma, { action: 'prescription.reviewed', entityType: 'prescription', entityId: p.id, metadata: { decision: body.decision } });
+      const rxOrder = await prisma.pharmacyOrder.findFirst({ where: { prescriptionId: p.id, providerId: params.providerId }, orderBy: { createdAt: 'desc' }, select: { id: true, reference: true, patient: { select: { accountUserId: true } } } });
+      if (rxOrder) {
+        await notifyUsers(prisma, [rxOrder.patient.accountUserId], {
+          key: `prescription.${body.decision.toLowerCase()}`,
+          title: body.decision === 'APPROVED' ? 'Prescription approved' : 'Prescription not approved',
+          body: body.decision === 'APPROVED' ? `The pharmacist approved your prescription for order ${rxOrder.reference}.` : `The pharmacist could not approve your prescription for order ${rxOrder.reference}.${body.note ? ` Reason: ${body.note}` : ''}`,
+          link: `/orders/medicine/${rxOrder.id}`,
+          level: 'important',
+          meta: { kind: 'prescription', id: p.id, providerId: params.providerId, status: body.decision },
+        });
+      }
       return { id: p.id, reviewStatus: p.reviewStatus };
     },
   });

@@ -1,4 +1,4 @@
-import { notifyProviderStaffMany } from '../notifications/events.js';
+import { notifyProviderStaffMany, notifyUsers, notifyUsersWithPermission, type NoticeLevel } from '../notifications/events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -56,7 +56,25 @@ async function moveDispatch(tx: Tx, id: string, to: DispatchStatus, actor: { use
   });
   if (res.count !== 1) throw conflict('The request changed concurrently');
   await tx.dispatchEvent.create({ data: { requestId: id, fromStatus: d.status, toStatus: to, actorUserId: actor.userId, actorKind: actor.kind, note } });
+  await notifyDispatchChange(tx, { id, reference: d.reference, requestedByUserId: d.requestedByUserId }, to);
   return d;
+}
+
+const DISPATCH_PATIENT_MESSAGES: Partial<Record<DispatchStatus, { title: string; body: string; level: NoticeLevel }>> = {
+  ARRIVED: { title: 'Ambulance has arrived', body: 'The ambulance is at the pickup point.', level: 'critical' },
+  COMPLETED: { title: 'Trip completed', body: 'Your emergency trip is complete. We hope everyone is safe.', level: 'light' },
+  NO_PROVIDER_AVAILABLE: { title: 'No ambulance available right now', body: 'Please call 112 immediately. We will keep trying to find an operator.', level: 'critical' },
+  ESCALATED: { title: 'Your request was escalated', body: 'Carevanta support is handling it. If the situation worsens, call 112.', level: 'critical' },
+};
+
+/** The patient follows the trip live; platform staff are pulled in when nobody can respond. */
+async function notifyDispatchChange(tx: Tx, d: { id: string; reference: string; requestedByUserId: string | null }, to: DispatchStatus) {
+  const meta = { kind: 'dispatch' as const, id: d.id, status: to };
+  const m = DISPATCH_PATIENT_MESSAGES[to];
+  if (m && d.requestedByUserId) await notifyUsers(tx, [d.requestedByUserId], { key: `dispatch.${to.toLowerCase()}`, title: m.title, body: `${m.body} (${d.reference})`, link: `/emergency/${d.id}`, level: m.level, meta });
+  if (to === 'NO_PROVIDER_AVAILABLE' || to === 'ESCALATED') {
+    await notifyUsersWithPermission(tx, 'dispatch.manage', { key: 'admin.dispatch_attention', title: to === 'ESCALATED' ? `Emergency escalated · ${d.reference}` : `No ambulance available · ${d.reference}`, body: 'An emergency request needs a human now.', link: '/dispatch', level: 'critical', meta });
+  }
 }
 
 const include = {
@@ -154,7 +172,7 @@ async function openRequest(input: {
         }
       }
       if (offers > 0) await moveDispatch(tx, req.id, 'OFFERED', { userId: null, kind: 'SYSTEM' }, `${offers} operator(s) notified`);
-      if (offers > 0) await notifyProviderStaffMany(tx, operators.map((o) => o.id), 'manage_dispatch', { key: 'portal.dispatch_offer', title: 'Emergency request — accept now', body: `${req.reference} · ${input.district ?? 'location pending'}`, link: '/dispatch', urgent: true });
+      if (offers > 0) await notifyProviderStaffMany(tx, operators.map((o) => o.id), 'manage_dispatch', { key: 'portal.dispatch_offer', level: 'critical', meta: { kind: 'dispatch', id: req.id, status: 'OFFERED' }, title: 'Emergency request — accept now', body: `${req.reference} · ${input.district ?? 'location pending'}`, link: '/dispatch', urgent: true });
       else await moveDispatch(tx, req.id, 'NO_PROVIDER_AVAILABLE', { userId: null, kind: 'SYSTEM' }, input.mode === 'TEST' ? 'Test drill: no operators notified' : 'No covering operator with an available vehicle');
     } else {
       await moveDispatch(tx, req.id, 'NO_PROVIDER_AVAILABLE', { userId: null, kind: 'SYSTEM' }, 'Live dispatch is not enabled; caller directed to 112');
@@ -632,6 +650,17 @@ async function acceptAssignment(
       // Withdraw competing offers.
       await tx.dispatchAssignment.updateMany({ where: { requestId, status: 'OFFERED', id: { not: a.id } }, data: { status: 'EXPIRED' } });
       await audit(tx, { action: 'dispatch.accepted', entityType: 'dispatch_request', entityId: requestId, actorUserId: input.userId, metadata: { assignmentId, vehicleId: vehicle.id, source: input.source } });
+      const reqRow = await tx.dispatchRequest.findUnique({ where: { id: requestId }, select: { reference: true, requestedByUserId: true } });
+      if (reqRow?.requestedByUserId) {
+        await notifyUsers(tx, [reqRow.requestedByUserId], {
+          key: 'dispatch.accepted',
+          title: 'Ambulance confirmed',
+          body: `${vehicle.registrationNumber} is on its way · about ${input.etaMinutes} min (${reqRow.reference})`,
+          link: `/emergency/${requestId}`,
+          level: 'critical',
+          meta: { kind: 'dispatch', id: requestId, providerId: a.operatorProviderId, status: 'ACCEPTED' },
+        });
+      }
     });
   } catch (err) {
     if (isPgError(err, '23505')) throw conflict('Another operator already accepted this request');
