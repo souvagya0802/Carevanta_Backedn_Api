@@ -120,21 +120,61 @@ const SERVICES: Array<{ code: string; name: string; category: 'CONSULTATION' | '
   { code: 'PROC_ECHO', name: 'Echocardiography (2D Echo)', category: 'PROCEDURE', speciality: 'CARDIOLOGY' },
 ];
 
-const TEMPLATES: Array<{ key: string; channel: 'EMAIL' | 'SMS'; subject?: string; body: string }> = [
-  { key: 'auth.password_reset', channel: 'EMAIL', subject: 'Reset your Carevanta password', body: 'Use this code to reset your password: {{token}}. It expires in {{expiresInMinutes}} minutes. If you did not request this, ignore this message.' },
+/**
+ * Default email layout: one centred card, inline styles only (email clients
+ * ignore stylesheets), no images, no region-specific content. The delivery
+ * driver derives the plain-text part from this HTML automatically.
+ */
+function emailHtml(heading: string, paragraphs: string[], highlight?: string): string {
+  const p = (t: string) => `<p style="margin:0 0 12px;font:15px/1.6 Arial,Helvetica,sans-serif;color:#1f2937">${t}</p>`;
+  const code = highlight ? `<p style="margin:16px 0;padding:12px 16px;background:#f3f4f6;border-radius:5px;font:600 22px/1.3 'Courier New',monospace;letter-spacing:2px;color:#111827;text-align:center">${highlight}</p>` : '';
+  return [
+    '<div style="background:#f3f4f6;padding:24px 12px">',
+    '<div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:5px;overflow:hidden">',
+    '<div style="background:#111111;padding:16px 24px;font:700 18px/1.3 Arial,Helvetica,sans-serif;color:#ffffff">Carevanta</div>',
+    `<div style="padding:24px"><h1 style="margin:0 0 16px;font:700 20px/1.3 Arial,Helvetica,sans-serif;color:#111827">${heading}</h1>${paragraphs.map(p).join('')}${code}</div>`,
+    '<div style="padding:12px 24px 20px;font:12px/1.5 Arial,Helvetica,sans-serif;color:#6b7280">This is an automated message from Carevanta. Please do not reply to it.</div>',
+    '</div></div>',
+  ].join('');
+}
+
+/** One default per (key, channel) in the notification catalogue; English, active, inserted only when nothing exists for that pair yet. */
+const TEMPLATES: Array<{ key: string; channel: 'EMAIL' | 'SMS' | 'PUSH' | 'IN_APP'; subject?: string; body: string }> = [
+  { key: 'auth.password_reset', channel: 'EMAIL', subject: 'Reset your Carevanta password', body: emailHtml('Reset your password', ['Use the code below to reset your Carevanta password. It expires in {{expiresInMinutes}} minutes.', 'If you did not request this, you can safely ignore this email.'], '{{token}}') },
   { key: 'auth.password_reset', channel: 'SMS', body: 'Carevanta password reset code: {{token}} (valid {{expiresInMinutes}} min). Do not share it.' },
-  { key: 'auth.verify_email', channel: 'EMAIL', subject: 'Verify your email for Carevanta', body: 'Your verification code is {{token}}.' },
+  { key: 'auth.verify_email', channel: 'EMAIL', subject: 'Verify your email for Carevanta', body: emailHtml('Verify your email address', ['Enter this code in the app to confirm your email address.'], '{{token}}') },
   { key: 'auth.verify_phone', channel: 'SMS', body: 'Your Carevanta verification code is {{token}}. It expires in 10 minutes.' },
-  { key: 'auth.account_created', channel: 'EMAIL', subject: 'Your Carevanta account', body: 'An administrator created a Carevanta account for you. Use the password reset code {{token}} to set your password.' },
+  { key: 'auth.account_created', channel: 'EMAIL', subject: 'Your Carevanta account is ready', body: emailHtml('Welcome to Carevanta', ['An administrator created a Carevanta account for you. Use the one-time code below to set your password. It is valid for 72 hours.'], '{{token}}') },
   { key: 'auth.account_created', channel: 'SMS', body: 'Carevanta: an account was created for you. Set your password with code {{token}} (valid 72 h).' },
   { key: 'booking.confirmed', channel: 'SMS', body: 'Carevanta: appointment {{reference}} is confirmed for {{when}}.' },
   { key: 'booking.cancelled', channel: 'SMS', body: 'Carevanta: appointment {{reference}} was cancelled.' },
-  { key: 'provider.status_changed', channel: 'EMAIL', subject: 'Your Carevanta provider application', body: 'Your provider application status is now {{status}}.' },
+  { key: 'booking.confirmed', channel: 'EMAIL', subject: 'Appointment {{reference}} confirmed for {{when}}', body: emailHtml('Your appointment is confirmed', ['Your appointment <strong>{{reference}}</strong> with {{doctorName}} is confirmed.', 'When: <strong>{{when}}</strong>', 'Please arrive a few minutes early and bring any previous reports or prescriptions.']) },
+  { key: 'booking.cancelled', channel: 'EMAIL', subject: 'Appointment {{reference}} cancelled', body: emailHtml('Your appointment was cancelled', ['Appointment <strong>{{reference}}</strong> with {{doctorName}} on {{when}} was cancelled.', 'Any payment you made will be refunded. Open the app to book another slot.']) },
+  { key: 'provider.status_changed', channel: 'EMAIL', subject: 'Your Carevanta provider application: {{status}}', body: emailHtml('Application update', ['The status of your provider application is now <strong>{{status}}</strong>.', 'Sign in to the provider portal to see the details and any next steps.']) },
+  { key: 'booking.reminder', channel: 'EMAIL', subject: 'Reminder: appointment {{reference}} on {{when}}', body: emailHtml('Your appointment is coming up', ['Hello {{patientName}}, this is a reminder that your appointment <strong>{{reference}}</strong> with {{doctorName}} at {{locationName}} is in about {{hoursBefore}} hours.', 'When: <strong>{{when}}</strong>', 'Please arrive a few minutes early and bring any previous reports or prescriptions.']) },
+  { key: 'booking.reminder', channel: 'PUSH', subject: 'Appointment in {{hoursBefore}} hours', body: '{{reference}} with {{doctorName}} at {{locationName}}, {{when}}.' },
+  { key: 'booking.reminder', channel: 'IN_APP', subject: 'Appointment reminder', body: 'Your appointment {{reference}} with {{doctorName}} at {{locationName}} is on {{when}} (in about {{hoursBefore}} hours).' },
+  { key: 'booking.requested', channel: 'EMAIL', subject: 'New appointment request {{reference}}', body: emailHtml('New appointment request', ['{{patientName}} has requested an appointment <strong>{{reference}}</strong> with {{doctorName}}.', 'Requested slot: <strong>{{when}}</strong>', 'Open the provider portal to confirm or propose another time.']) },
+  { key: 'booking.requested', channel: 'IN_APP', subject: 'New appointment request', body: '{{patientName}} requested {{reference}} with {{doctorName}} for {{when}}.' },
+  { key: 'booking.rescheduled', channel: 'EMAIL', subject: 'Appointment {{reference}} moved to {{when}}', body: emailHtml('Your appointment was rescheduled', ['Appointment <strong>{{reference}}</strong> with {{doctorName}} now takes place on <strong>{{when}}</strong>.', 'If the new time does not suit you, open the app to pick another slot.']) },
+  { key: 'booking.rescheduled', channel: 'IN_APP', subject: 'Appointment rescheduled', body: '{{reference}} with {{doctorName}} is now on {{when}}.' },
+  { key: 'order.status_changed', channel: 'EMAIL', subject: '{{kind}} order {{reference}}: {{status}}', body: emailHtml('Order update', ['Your {{kind}} order <strong>{{reference}}</strong> is now: <strong>{{status}}</strong>.', 'Open the app to see the full order and any reports attached to it.']) },
+  { key: 'order.status_changed', channel: 'IN_APP', subject: '{{kind}} order {{status}}', body: 'Order {{reference}} is now {{status}}.' },
+  { key: 'dispatch.status_changed', channel: 'EMAIL', subject: 'Emergency request {{reference}}: {{status}}', body: emailHtml('Emergency request update', ['Your emergency request <strong>{{reference}}</strong> is now: <strong>{{status}}</strong>.', 'Follow it live in the app. If the situation worsens, call your national emergency number at once.']) },
+  { key: 'dispatch.status_changed', channel: 'IN_APP', subject: 'Emergency request {{status}}', body: 'Emergency request {{reference}} is now {{status}}.' },
+  { key: 'support.reply', channel: 'EMAIL', subject: 'Reply on your support case {{caseReference}}', body: emailHtml('Support has replied', ['There is a new reply on your support case <strong>{{caseReference}}</strong>.', 'Open the app to read it and continue the conversation. Please do not reply to this email.']) },
+  { key: 'support.reply', channel: 'IN_APP', subject: 'Support replied', body: 'New reply on your case {{caseReference}}.' },
+  { key: 'catalogue.medicines_synced', channel: 'EMAIL', subject: 'Medicine list sync: {{status}}', body: emailHtml('Medicine list sync', ['{{summary}}', 'CDCI release date: <strong>{{releaseDate}}</strong>', 'Open the Catalogue page in the admin dashboard to review the medicines. Medicine names from Common Drug Codes for India (CDCI), C-DAC / NRCeS, MoHFW, CC BY 4.0.']) },
+  { key: 'catalogue.medicines_synced', channel: 'IN_APP', subject: 'Medicine list sync: {{status}}', body: '{{summary}}' },
 ];
 
 const SETTINGS: Array<{ key: string; value: unknown; description: string }> = [
   { key: 'booking.patient_cancellation_cutoff_minutes', value: 120, description: 'Patients may cancel without penalty until this many minutes before the slot.' },
   { key: 'booking.require_provider_confirmation', value: true, description: 'Appointments start as REQUESTED and need provider confirmation.' },
+  { key: 'booking.reminders_enabled', value: true, description: 'Send patients a reminder (in-app, push, email) before each confirmed booking.' },
+  { key: 'booking.reminder_lead_hours', value: '24,2', description: 'Hours before a booking at which reminders go out, comma-separated (largest first).' },
+  { key: 'catalogue.cdci_sync_enabled', value: true, description: 'Check monthly for a new CDCI medicine list release and apply it after validation.' },
+  { key: 'catalogue.cdci_source_base_url', value: 'https://raw.githubusercontent.com/ohcnetwork/cdci/main/data/source', description: 'Folder the CDCI flat files are downloaded from (CC BY 4.0 mirror by default).' },
   { key: 'finance.settlement_hold_days', value: 7, description: 'Days after service completion before earnings become settleable.' },
   { key: 'finance.commission_on_provider_direct', value: false, description: 'Charge commission on PROVIDER_DIRECT (walk-in) bookings. Default off.' },
   { key: 'emergency.public_number', value: '112', description: 'National emergency number shown first on every emergency screen.' },

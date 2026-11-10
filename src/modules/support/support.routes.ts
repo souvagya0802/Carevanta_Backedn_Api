@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { notifyUsersWithPermission } from '../notifications/events.js';
+import { emailUsers } from '../notifications/email-events.js';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
@@ -323,7 +324,12 @@ export function supportRouter(): Router {
       const c = await prisma.supportCase.findUnique({ where: { id: params.id } });
       if (!c) throw notFound('Support case');
       if (c.status === 'CLOSED') throw conflict('Case is closed');
-      const e = await prisma.supportCaseEvent.create({ data: { caseId: c.id, authorId: auth.userId, kind: 'COMMENT', body: body.body, isInternal: body.isInternal } });
+      const e = await prisma.$transaction(async (tx) => {
+        const ev = await tx.supportCaseEvent.create({ data: { caseId: c.id, authorId: auth.userId, kind: 'COMMENT', body: body.body, isInternal: body.isInternal } });
+        // A reply the case owner can see is also emailed to them (internal notes are not).
+        if (!body.isInternal) await emailUsers(tx, [c.reporterUserId], 'support.reply', { caseReference: c.reference }, auth.userId);
+        return ev;
+      });
       return { id: e.id, createdAt: e.createdAt.toISOString() };
     },
   });

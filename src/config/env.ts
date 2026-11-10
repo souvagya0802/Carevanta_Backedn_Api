@@ -58,6 +58,11 @@ const EnvSchema = z
     GEOCODER_API_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
     GEOCODER_CONTACT_EMAIL: z.preprocess((v) => (v === '' ? undefined : v), z.string().email().optional()),
 
+    // Redis (optional): backs the per-slot booking lock so API instances agree on who books a contested slot.
+    // Unset/blank → in-process lock, correct for ONE instance only; set it before running two or more.
+    // redis:// or rediss:// (TLS) URL with any credentials inside it; .env only, never logged.
+    REDIS_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url({ protocol: /^rediss?$/ }).optional()),
+
     STORAGE_DRIVER: z.enum(['local']).default('local'),
     STORAGE_LOCAL_DIR: z.string().default('./storage'),
     MAX_UPLOAD_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(10 * 1024 * 1024),
@@ -66,6 +71,13 @@ const EnvSchema = z
     // Only for load testing from a single IP; never disable in production.
     RATE_LIMIT_ENABLED: booleanString.default(true),
     OPENAPI_ENABLED: booleanString.default(true),
+    // Prometheus-style text metrics at GET /metrics (per instance). Off by default; when on, set METRICS_TOKEN
+    // so only the scraper (Authorization: Bearer <token>) can read route-level traffic figures.
+    METRICS_ENABLED: booleanString.default(false),
+    METRICS_TOKEN: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(16).optional()),
+    // How long SIGTERM waits for in-flight requests before open connections (SSE streams, keep-alive sockets) are
+    // closed so the process can exit. Must be shorter than the orchestrator's kill grace period.
+    SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
   })
   .superRefine((env, ctx) => {
     if (env.APP_ENV === 'production') {
@@ -77,6 +89,9 @@ const EnvSchema = z
       }
       if (!env.RAZORPAY_WEBHOOK_SECRET) {
         ctx.addIssue({ code: 'custom', path: ['RAZORPAY_WEBHOOK_SECRET'], message: 'required in production' });
+      }
+      if (env.METRICS_ENABLED && !env.METRICS_TOKEN) {
+        ctx.addIssue({ code: 'custom', path: ['METRICS_TOKEN'], message: 'required in production when METRICS_ENABLED=true' });
       }
     }
   });

@@ -43,6 +43,7 @@ Why not microservices: one small team, one database, and every business transact
 | Invariant | Enforcement |
 |---|---|
 | A slot never exceeds capacity | conditional `UPDATE … WHERE booked_count < capacity` (serialised on the row) + CHECK constraint |
+| Concurrent bookings of one slot are decided fairly | per-slot lock (`src/lib/slot-lock.ts`: Redis `SET NX PX` + Lua compare-and-delete when `REDIS_URL` is set, FIFO in-process queue otherwise) makes callers take turns in arrival order; the slot `version` compare-and-set inside the transaction stays the final guard |
 | A doctor is never bookable in two places at once | EXCLUDE constraint on `(doctor_provider_id, tstzrange(starts_at, ends_at))` |
 | At most one live affiliation per doctor+facility | partial unique index on live statuses |
 | Status columns move only along the defined graph | `assertTransition` + optimistic `UPDATE … WHERE status = :from AND version = :v` |
@@ -64,7 +65,7 @@ Why not microservices: one small team, one database, and every business transact
 
 ## Scalability posture
 
-Stateless API instances behind a load balancer; driver pools per instance must stay under the Atlas connection limit for the tier. Vertical Atlas tier headroom covers the pilot and the first expansion. Known next steps, triggered by measurement rather than guesses: shared rate-limit store (Redis) once there are ≥ 2 instances, PostGIS for multi-district radius search, `audit_events` partitioning by month once it passes ~50 M rows, read replica for analytics. See `docs/performance.md` for measured numbers and `docs/database.md` for index rationale.
+Stateless API instances behind a load balancer; driver pools per instance must stay under the Atlas connection limit for the tier. Vertical Atlas tier headroom covers the pilot and the first expansion. Redis is optional and today backs only the slot-booking lock: without `REDIS_URL` the lock is in-process, which is correct for a single instance only, so `REDIS_URL` is mandatory from the second instance on (see `docs/operations.md`). Known next steps, triggered by measurement rather than guesses: shared rate-limit store (the same Redis) once there are ≥ 2 instances, PostGIS for multi-district radius search, `audit_events` partitioning by month once it passes ~50 M rows, read replica for analytics. See `docs/performance.md` for measured numbers and `docs/database.md` for index rationale.
 
 ## Repository layout
 

@@ -7,6 +7,8 @@ import { runWithLease, WORKER_ID } from './lib/job-lease.js';
 import { deliverQueuedNotifications } from './modules/notifications/notifications.service.js';
 import { runQueuedExports } from './modules/exports/exports.service.js';
 import { autoNoShow, cleanupExpired, enforceCredentialExpiry, openRenewalReminders } from './jobs/maintenance.js';
+import { sendBookingReminders } from './jobs/reminders.js';
+import { CDCI_SYNC_JOB, CDCI_SYNC_LEASE_MS, syncCdci } from './jobs/cdci-sync.js';
 
 /**
  * Background worker (separate process: `npm run start:worker`). Jobs are
@@ -23,6 +25,10 @@ const JOBS: Record<string, { cron: string; leaseMs: number; run: () => Promise<u
   'maintenance.renewal-reminders': { cron: '30 2 * * *', leaseMs: 30 * 60_000, run: () => openRenewalReminders() },
   'maintenance.cleanup': { cron: '45 3 * * *', leaseMs: 30 * 60_000, run: () => cleanupExpired() },
   'maintenance.auto-no-show': { cron: '0 * * * *', leaseMs: 30 * 60_000, run: () => autoNoShow() },
+  // Patient reminders (in-app + push + email outbox) at the configured lead times, e.g. 24 h and 2 h before the slot.
+  'bookings.reminders': { cron: '*/5 * * * *', leaseMs: 10 * 60_000, run: () => sendBookingReminders() },
+  // Medicine list (CDCI): monthly check for a new release; validated, applied and reported to catalogue admins. Same lease name as the admin "sync now" trigger.
+  [CDCI_SYNC_JOB]: { cron: '30 3 1 * *', leaseMs: CDCI_SYNC_LEASE_MS, run: () => syncCdci() },
 };
 
 if (!env.JOBS_ENABLED) {

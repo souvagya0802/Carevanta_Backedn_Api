@@ -289,7 +289,14 @@ export const MODELS: Record<string, ModelMeta> = {
       "strength",
       "dosageForm",
       "packSize",
-      "manufacturer"
+      "manufacturer",
+      "code",
+      "genericCode",
+      "composition",
+      "route",
+      "proposedByProviderId",
+      "proposedByUserId",
+      "searchName"
     ],
     foreignKeys: [],
     relations: {

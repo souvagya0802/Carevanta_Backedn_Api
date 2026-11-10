@@ -21,6 +21,8 @@ tests/integration/bookings.test.ts        IST slot generation, EXCLUDE overlap, 
 tests/integration/finance.test.ts         policies (maker-checker, overlap, legal gate), webhooks (forged/mismatch/duplicate/failed), completion → snapshot → ledger, policy change immutability, walk-in exclusion, refunds, settlements, reconciliation
 tests/integration/operations.test.ts      diagnostics (coverage, report versions, access), pharmacy (FEFO, prescriptions, release), dispatch (112, acceptance, vehicle state, drills), support, settings, audit, exports
 tests/integration/maintenance.test.ts     credential expiry, renewal reminders, cleanup, seed idempotency
+tests/integration/hardening.test.ts       security headers, CORS allow-list, request ids, JSON/size/encoding errors → 4xx, error envelope, no-store default, health semantics, auth rate limit headers, /metrics gating
+tests/unit/middleware-hardening.test.ts   log masking (email/phone) and secret redaction through a real pino instance, error-handler mapping (body-parser, URIError, unknown → generic 500), metrics exposition
 ```
 
 ## Commands and last results (2026-10-17, Windows 11, Node 22.23)

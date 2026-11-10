@@ -3,7 +3,7 @@
  * per app and one per provider type, attached to the existing demo data so
  * every screen has something to show. The full list is in docs/demo-logins.md.
  *
- *   Super Admin  admin@gmail.com / Admin@123
+ *   (No super admin here: the platform super admin is a real account managed in the dashboard, never a shared demo login.)
  *   Providers    hospital@, clinic@, doctor@, lab@, imaging@, pharmacy@, ambulance@ (gmail.com), plus provider@gmail.com for all of them
  *   Patient      user@gmail.com / User@123 (a family of three seeded patients with their full history)
  *
@@ -27,7 +27,6 @@ if (process.env.APP_ENV === 'production') {
 }
 
 const ACCOUNTS = {
-  admin: { email: 'admin@gmail.com', password: 'Admin@123', fullName: 'Platform Admin' },
   provider: { email: 'provider@gmail.com', password: 'Prov@123', fullName: 'Demo Provider Owner' },
   user: { email: 'user@gmail.com', password: 'User@123', fullName: 'Pooja Patra' },
 };
@@ -73,12 +72,7 @@ async function ensureOwner(providerId: string, userId: string) {
 }
 
 async function main() {
-  // 1. Super admin
-  const admin = await upsertLogin(ACCOUNTS.admin);
-  const superAdmin = await prisma.role.findUniqueOrThrow({ where: { key: 'SUPER_ADMIN' } });
-  if (!(await prisma.userRole.findFirst({ where: { userId: admin.id, roleId: superAdmin.id, revokedAt: null } }))) {
-    await prisma.userRole.create({ data: { userId: admin.id, roleId: superAdmin.id, reason: 'Demo login requested by founder (development only)' } });
-  }
+  // 1. (No shared super admin: it is a real account, created and managed in the dashboard.)
 
   // 2. One owner login per provider type, and provider@gmail.com as owner of all of them
   const allInOne = await upsertLogin(ACCOUNTS.provider);
@@ -140,7 +134,6 @@ async function main() {
   const counts = [{ appts: BigInt(appts), labs: BigInt(labs), rx: BigInt(rx) }];
 
   console.log('Demo logins ready (development only):');
-  console.log(`  Super Admin  ${ACCOUNTS.admin.email} / ${ACCOUNTS.admin.password}`);
   console.log('  Providers:');
   for (const line of providerLines) console.log(line);
   console.log(`  ALL PROVIDERS      ${ACCOUNTS.provider.email} / ${ACCOUNTS.provider.password}  → ${allOrgs.join(', ')}`);

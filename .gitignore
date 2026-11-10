@@ -12,3 +12,6 @@ storage/
 load/results/
 .vscode/*
 !.vscode/extensions.json
+
+# CDCI medicine data files (download them, see data/cdci/README.md)
+data/cdci/*.txt

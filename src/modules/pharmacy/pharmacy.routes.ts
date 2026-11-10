@@ -1,4 +1,5 @@
 import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
+import { emailUsers, titleCaseStatus } from '../notifications/email-events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -182,6 +183,7 @@ async function notifyPharmacyChange(tx: Tx, orderId: string, to: PharmacyOrderSt
     }
     return;
   }
+  await emailUsers(tx, [o.patient.accountUserId], 'order.status_changed', { reference: o.reference, kind: 'Pharmacy', status: titleCaseStatus(to) }, actorUserId);
   const m = RX_PATIENT_MESSAGES[to];
   if (!m) return;
   const why = m.level === 'important' && reason ? ` Reason: ${reason}` : '';
@@ -251,10 +253,11 @@ export async function createPharmacyOrder(input: {
     const medicines = await tx.medicine.findMany({ where: { id: { in: input.items.map((i) => i.medicineId) }, isActive: true } });
     if (medicines.length !== new Set(input.items.map((i) => i.medicineId)).size) throw badRequest('Unknown or inactive medicine');
     const needsRx = medicines.some((m) => m.requiresPrescription);
+    // A prescription id, when given, must be this patient's even for an over-the-counter basket; otherwise the order would carry a dangling reference.
+    const rx = input.prescriptionId ? await tx.prescription.findFirst({ where: { id: input.prescriptionId, patientProfileId: patient.id } }) : null;
+    if (input.prescriptionId && !rx) throw badRequest('Prescription not found for this patient');
     if (needsRx) {
-      if (!input.prescriptionId) throw preconditionFailed('A prescription is required for one or more medicines');
-      const rx = await tx.prescription.findFirst({ where: { id: input.prescriptionId, patientProfileId: patient.id } });
-      if (!rx) throw badRequest('Prescription not found for this patient');
+      if (!rx) throw preconditionFailed('A prescription is required for one or more medicines');
       if (rx.reviewStatus === 'REJECTED') throw preconditionFailed('The prescription was rejected by the pharmacist');
       if (rx.validUntil && rx.validUntil < new Date()) throw preconditionFailed('The prescription has expired');
     }
@@ -424,6 +427,10 @@ export function pharmacyRouter(): Router {
       await assertProviderAccess(auth, params.providerId, { capability: 'review_prescriptions' });
       const linked = await prisma.pharmacyOrder.count({ where: { prescriptionId: params.id, providerId: params.providerId } });
       if (!linked) throw notFound('Prescription');
+      // An approval that is already expired would block the very order it was reviewed for.
+      if (body.decision === 'APPROVED' && body.validUntil && body.validUntil < new Date().toISOString().slice(0, 10)) {
+        throw badRequest('validUntil cannot be in the past');
+      }
       const p = await prisma.prescription.update({
         where: { id: params.id },
         data: { reviewStatus: body.decision, reviewNote: body.note, reviewedByUserId: auth.userId, reviewedAt: new Date(), validUntil: body.validUntil ? new Date(body.validUntil) : undefined },

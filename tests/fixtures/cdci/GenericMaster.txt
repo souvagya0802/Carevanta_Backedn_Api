@@ -1,0 +1,5 @@
+Identifier	Generic Name	Substance Identifier	Route of Administration	Dose Form	Therapeutic Role	Indication	Contra Indication	Interaction with Drugs	Classification of Drugs	Source/ Regulatory	last_updated_on
+6001	Paracetamol 650 mg oral tablet	1	26643006	2							20260101	
+6002	Paracetamol 500 mg oral tablet	1	26643006	2							20260101	
+6003	Caffeine 30 mg and paracetamol 500 mg oral tablet	1+3	26643006	2							20260101	
+6005	Paracetamol 25 mg/mL oral suspension	1	26643006	2							20260101	

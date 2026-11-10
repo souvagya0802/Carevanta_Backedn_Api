@@ -37,12 +37,15 @@ Custom-role safeguards: a role may only contain permissions its author holds; a 
 
 ## Residual risks and recommendations
 
-1. **Rate limiting is per API instance.** With ≥ 2 instances, add a shared store (Redis) or move limits to the load balancer/WAF.
+1. **Rate limiting is per API instance.** With ≥ 2 instances, add a shared store (Redis is already provisioned for slot locks; `rate-limit-redis` would plug into `src/middleware/rate-limit.ts`) or move limits to the load balancer/WAF. Public discovery search and type-ahead currently fall under the global 600/min limit only; `searchLimiter` (120/min) is exported and should be mounted on `/discovery/search` and `/discovery/suggest`.
 2. **No MFA yet.** Add TOTP or passkeys for roles holding sensitive permissions before production.
 3. **Local object storage** is for development/single-node pilots. Production should use encrypted object storage (SSE-KMS) with short-lived signed URLs; the storage interface is isolated in `src/lib/storage.ts`.
 4. **Secret rotation**: `DATA_ENCRYPTION_KEY` has a key id (`k1`) so a second key can be introduced for re-encryption; `JWT_SECRET` rotation invalidates access tokens only (15 min).
 5. **Dependency hygiene**: run `npm audit` and Dependabot/Renovate; pin versions (done in `package-lock.json`).
 6. **Penetration test** before launch, focused on the portal endpoints and file access paths.
+7. **OpenAPI in production.** `OPENAPI_ENABLED` defaults to true; set it to false in production (or put `/docs` behind the edge's auth) so the full route map is not public.
+8. **Response shapes are mapped by hand.** `defineRoute`'s `response` schema documents the output but does not strip it; every handler builds its DTO explicitly (verified for users, auth/me, patient and public routes). Parsing the response through the schema in non-production would catch a future handler that returns a raw record.
+9. **Metrics endpoint.** `/metrics` is off by default and token-protected when on; keep it off the public listener or scrape it over the private network.
 
 ### Manual finance operations
 
@@ -58,4 +61,8 @@ Custom-role safeguards: a role may only contain permissions its author holds; a 
 - [ ] Configure WAF / shared rate limiting; enforce TLS 1.2+ and HSTS at the edge
 - [ ] Turn on database backups + PITR, test restore (see operations)
 - [ ] Ship logs to a central store with retention; alert on `access.denied` spikes, webhook signature failures, lockouts
+- [ ] `OPENAPI_ENABLED=false`, `METRICS_ENABLED=true` + `METRICS_TOKEN` (private scrape only), `SHUTDOWN_DRAIN_MS` below the orchestrator's grace period
+- [ ] Run the API as the image's non-root user with a read-only filesystem (as in `docker-compose.yml`); mount only `/data/storage`
+- [ ] Atlas: separate database users for the application (`readWrite`) and for retention/restore operations; no `dbAdmin` on the application user
+- [ ] Mount `searchLimiter` on the public discovery endpoints; confirm `TRUST_PROXY` equals the number of proxies so limits key on client IPs
 - [ ] Review `docs/compliance.md` register with counsel; record outcomes in commission policies' legal review

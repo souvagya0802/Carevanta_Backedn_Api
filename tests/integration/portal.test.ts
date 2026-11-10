@@ -20,6 +20,7 @@ describe('provider portal — organisation self-service', () => {
     expect(me.body.data.memberships).toHaveLength(1);
     expect(me.body.data.memberships[0]).toMatchObject({ providerId: h.id, memberRole: 'OWNER' });
     expect(me.body.data.memberships[0].capabilities).toContain('manage_staff');
+    expect(me.body.data.memberships[0].specialities).toEqual([]);
 
     // Profile read carries my role; edit uses optimistic concurrency.
     const detail = await owner.get(`/api/v1/portal/providers/${h.id}`);
@@ -205,6 +206,8 @@ describe('provider portal — organisation self-service', () => {
     const me = await doctor.get('/api/v1/portal/me');
     expect(me.body.data.ownDoctorProviderId).toBe(doc.id);
     expect(me.body.data.memberships[0]).toMatchObject({ providerId: doc.id, memberRole: 'OWNER', type: 'DOCTOR' });
+    // The practice carries its speciality names so the portal can greet the doctor with it.
+    expect(me.body.data.memberships[0].specialities).toEqual(['Gastroenterology']);
     const v = await doctor.get(`/api/v1/portal/providers/${doc.id}/verification`);
     expect(v.body.data.requiredChecks).toContain('PROFESSIONAL_REGISTRATION');
     expect((await doctor.get(`/api/v1/portal/providers/${doc.id}/appointments-today`)).status).toBe(200);

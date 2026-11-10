@@ -9,7 +9,7 @@ import { DateTimeString, Reason, iso } from '../../http/dto.js';
 import { makeReference, REF } from '../../lib/reference.js';
 import { invalidateSetting } from '../settings/settings.service.js';
 import { describeSetting, validateSettingValue } from '../settings/settings.meta.js';
-import { NOTIFICATION_CATALOGUE, channelDrivers, deliverQueuedNotifications, maskRecipient, notificationKeyInfo, placeholders, render, smsSegments } from '../notifications/notifications.service.js';
+import { NOTIFICATION_CATALOGUE, channelDrivers, deliverQueuedNotifications, htmlToText, isHtml, maskRecipient, notificationKeyInfo, placeholders, render, smsSegments } from '../notifications/notifications.service.js';
 import { sendEmail } from './integrations.service.js';
 import { env } from '../../config/env.js';
 import type { Prisma } from '../../../generated/prisma/client.js';
@@ -323,7 +323,10 @@ export function platformRouter(): Router {
     else if (!info.channels.includes(input.channel as never)) warnings.push(`${input.key} is only sent by ${info.channels.join(' and ')}; a ${input.channel} template will not be used`);
     if (unused.length) warnings.push(`Not using ${unused.map((u) => `{{${u}}}`).join(', ')} — make sure the message still makes sense without it`);
     const sample = info?.sample ?? Object.fromEntries(used.map((u) => [u, `<${u}>`]));
-    const rendered = { subject: input.subject ? render(input.subject, sample) : null, body: render(input.body, sample) };
+    const body = render(input.body, sample);
+    const html = isHtml(input.body);
+    if (html && input.channel !== 'EMAIL') errors.push(`${input.channel} messages are plain text; remove the HTML tags`);
+    const rendered = { subject: input.subject ? render(input.subject, sample) : null, body, isHtml: html, text: html ? htmlToText(body) : body };
     const sms = input.channel === 'SMS' ? smsSegments(rendered.body) : null;
     if (sms && sms.segments > 3) warnings.push(`Long SMS: ${sms.segments} parts (${sms.encoding}); carriers may truncate or reject it`);
     return { errors, warnings, placeholders: used, rendered, sms };
@@ -358,7 +361,7 @@ export function platformRouter(): Router {
     status: 200,
     permissions: ['notifications.read'],
     body: z.object({ key: z.string().max(96), channel: Channel, subject: z.string().max(200).optional(), body: z.string().max(8000) }),
-    response: z.object({ errors: z.array(z.string()), warnings: z.array(z.string()), placeholders: z.array(z.string()), rendered: z.object({ subject: z.string().nullable(), body: z.string() }), sms: z.object({ encoding: z.string(), length: z.number().int(), segments: z.number().int() }).nullable() }),
+    response: z.object({ errors: z.array(z.string()), warnings: z.array(z.string()), placeholders: z.array(z.string()), rendered: z.object({ subject: z.string().nullable(), body: z.string(), isHtml: z.boolean(), text: z.string() }), sms: z.object({ encoding: z.string(), length: z.number().int(), segments: z.number().int() }).nullable() }),
     handler: async ({ body }) => lintTemplate(body),
   });
 
@@ -376,7 +379,10 @@ export function platformRouter(): Router {
       if (!t) throw notFound('Active EMAIL template');
       const sample = notificationKeyInfo(body.key)?.sample ?? {};
       const subject = `[TEST] ${render(t.subject ?? 'Carevanta', sample)}`;
-      const { messageId } = await sendEmail(body.to, subject, `${render(t.body, sample)}\n\n— Test message sent from the Carevanta admin panel with sample values. No real code or booking is attached.`);
+      const rendered = render(t.body, sample);
+      const note = 'Test message sent from the Carevanta admin panel with sample values. No real code or booking is attached.';
+      const html = isHtml(rendered);
+      const { messageId } = await sendEmail(body.to, subject, `${html ? htmlToText(rendered) : rendered}\n\n— ${note}`, html ? `${rendered}<p style="font:12px/1.5 Arial,sans-serif;color:#6b7280;margin-top:16px">— ${note}</p>` : undefined);
       await audit(prisma, { action: 'notification_template.test_sent', entityType: 'notification_template', entityId: t.id, actorUserId: auth.userId, metadata: { key: t.key, to: maskRecipient(body.to) } });
       return { messageId, subject };
     },
@@ -418,6 +424,49 @@ export function platformRouter(): Router {
         await audit(tx, { action: 'notification_template.published', entityType: 'notification_template', entityId: t.id, metadata: { key: t.key, channel: t.channel, version: t.version } });
         return { id: t.id, key: t.key, channel: t.channel, locale: t.locale, version: t.version, subject: t.subject, body: t.body, isActive: t.isActive };
       });
+    },
+  });
+
+  const templateDto = (t: { id: string; key: string; channel: string; locale: string; version: number; subject: string | null; body: string; isActive: boolean }) => ({ id: t.id, key: t.key, channel: t.channel, locale: t.locale, version: t.version, subject: t.subject, body: t.body, isActive: t.isActive });
+
+  defineRoute(r, '/admin/notification-templates', {
+    method: 'post',
+    path: '/:id/activate',
+    summary: 'Make this version the active one for its key, channel and language (any other active version is deactivated)',
+    tags: ['Admin · Notifications'],
+    status: 200,
+    permissions: ['notifications.manage'],
+    params: IdParams,
+    response: TemplateDto,
+    handler: async ({ params, auth }) =>
+      prisma.$transaction(async (tx) => {
+        const t = await tx.notificationTemplate.findUnique({ where: { id: params.id } });
+        if (!t) throw notFound('Notification template');
+        if (t.isActive) return templateDto(t);
+        await tx.notificationTemplate.updateMany({ where: { key: t.key, channel: t.channel, locale: t.locale, isActive: true }, data: { isActive: false } });
+        const u = await tx.notificationTemplate.update({ where: { id: t.id }, data: { isActive: true, updatedById: auth.userId } });
+        await audit(tx, { action: 'notification_template.activated', entityType: 'notification_template', entityId: t.id, metadata: { key: t.key, channel: t.channel, locale: t.locale, version: t.version } });
+        return templateDto(u);
+      }),
+  });
+
+  defineRoute(r, '/admin/notification-templates', {
+    method: 'post',
+    path: '/:id/deactivate',
+    summary: 'Switch this version off; deliveries of its key and channel are skipped (not retried) until a version is active again',
+    tags: ['Admin · Notifications'],
+    status: 200,
+    permissions: ['notifications.manage'],
+    params: IdParams,
+    body: z.object({ reason: Reason.optional() }).default({}),
+    response: TemplateDto,
+    handler: async ({ params, body, auth }) => {
+      const t = await prisma.notificationTemplate.findUnique({ where: { id: params.id } });
+      if (!t) throw notFound('Notification template');
+      if (!t.isActive) throw conflict('This version is already inactive');
+      const u = await prisma.notificationTemplate.update({ where: { id: t.id }, data: { isActive: false, updatedById: auth.userId } });
+      await audit(prisma, { action: 'notification_template.deactivated', entityType: 'notification_template', entityId: t.id, actorUserId: auth.userId, metadata: { key: t.key, channel: t.channel, locale: t.locale, version: t.version, reason: body.reason ?? null } });
+      return templateDto(u);
     },
   });
 

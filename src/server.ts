@@ -4,6 +4,7 @@ import { env } from './config/env.js';
 import { logger } from './lib/logger.js';
 import { ensureIndexes } from './lib/mongo-indexes.js';
 import { closeMongoClient } from './lib/mongo-client.js';
+import { closeRedis, initRedis } from './lib/redis.js';
 import { prisma } from './lib/prisma.js';
 import { stopNotificationStreams } from './modules/notifications/stream.js';
 
@@ -39,6 +40,7 @@ server.requestTimeout = 30_000;
 server.headersTimeout = 20_000;
 server.keepAliveTimeout = 65_000;
 
+initRedis(); // slot-booking lock backend: Redis when REDIS_URL is set, else one warning and the in-process lock
 server.listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'carevanta-api listening');
 });
@@ -57,15 +59,31 @@ async function shutdown(signal: string) {
   server.close(async () => {
     await stopNotificationStreams().catch(() => undefined);
     await closeMongoClient().catch(() => undefined);
+    await closeRedis();
     await prisma.$disconnect().catch(() => undefined);
     logger.info('shutdown complete');
     process.exit(0);
   });
   server.closeIdleConnections();
+  // `server.close` only resolves once every connection has ended. SSE streams (/portal/notifications/stream) and
+  // keep-alive sockets never end on their own, so after the drain window they are closed here; EventSource
+  // clients reconnect to the next healthy instance (the stream sends `retry: 5000`).
+  const drain = setTimeout(() => {
+    logger.info({ drainMs: env.SHUTDOWN_DRAIN_MS }, 'drain window over; closing remaining connections');
+    server.closeAllConnections();
+  }, env.SHUTDOWN_DRAIN_MS);
+  drain.unref();
 }
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
+// A thrown error outside any request leaves the process in an unknown state: log it and let the orchestrator
+// replace the instance (readiness flips to 503 first so the load balancer stops routing here).
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaught exception; exiting');
+  markShuttingDown();
+  setTimeout(() => process.exit(1), 500).unref();
+});
 process.on('unhandledRejection', (reason) => {
   logger.error({ err: reason }, 'unhandled promise rejection');
 });

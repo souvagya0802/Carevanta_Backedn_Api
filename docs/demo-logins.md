@@ -17,7 +17,7 @@ Every account below works on the local development setup and points at real demo
 
 | Email | Password | Role |
 | --- | --- | --- |
-| admin@gmail.com | Admin@123 | Super Admin (every permission) |
+| carevanta.official2026@gmail.com | Kept by the founder (not written here) | Super Admin (every permission). The old admin@gmail.com was deactivated on 2026-11-10. |
 
 ## Provider Portal (port 3001), One Login Per Provider Type
 

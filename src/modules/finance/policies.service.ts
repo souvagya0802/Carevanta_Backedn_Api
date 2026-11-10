@@ -66,6 +66,9 @@ export interface PolicyInput {
 export async function createPolicy(actor: AuthContext, input: PolicyInput) {
   if (input.method === 'PERCENTAGE' && input.rateBps == null) throw badRequest('rateBps is required for PERCENTAGE');
   if (input.method === 'FLAT' && input.flatMinor == null) throw badRequest('flatMinor is required for FLAT');
+  // These were CHECK constraints on PostgreSQL; MongoDB has none, so the rules live here.
+  if (input.minMinor != null && input.maxMinor != null && input.minMinor > input.maxMinor) throw badRequest('minMinor cannot exceed maxMinor');
+  if (input.effectiveTo && new Date(input.effectiveTo) <= new Date(input.effectiveFrom)) throw badRequest('effectiveTo must be after effectiveFrom');
   if (input.providerId) {
     const p = await prisma.provider.findUnique({ where: { id: input.providerId } });
     if (!p) throw badRequest('Unknown provider');
@@ -111,6 +114,7 @@ export async function createPolicy(actor: AuthContext, input: PolicyInput) {
 
 export async function submitPolicy(actor: AuthContext, id: string) {
   return prisma.$transaction(async (tx) => {
+    if (!(await tx.commissionPolicy.findUnique({ where: { id }, select: { id: true } }))) throw notFound('Commission policy');
     const res = await tx.commissionPolicy.updateMany({ where: { id, status: 'DRAFT' }, data: { status: 'PENDING_APPROVAL' } });
     if (res.count !== 1) throw conflict('Only a DRAFT policy can be submitted');
     await audit(tx, { action: 'commission_policy.submitted', entityType: 'commission_policy', entityId: id, actorUserId: actor.userId });

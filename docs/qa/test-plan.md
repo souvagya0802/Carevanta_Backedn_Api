@@ -37,7 +37,7 @@ Scope: the three products (Super Admin dashboard, Provider portal, Patient app) 
 | UI-09 | Dates and times in IST, money as ₹ with two decimals, Indian phone format |
 | UI-10 | Keyboard and screen reader basics: focus visible, labels on inputs and icon buttons |
 
-## 2. Super Admin Dashboard (http://localhost:3000, admin@gmail.com / Admin@123)
+## 2. Super Admin Dashboard (http://localhost:3000, a super-admin login supplied by the founder)
 
 | ID | Area | Steps | Expected |
 | --- | --- | --- | --- |
@@ -61,7 +61,7 @@ Scope: the three products (Super Admin dashboard, Provider portal, Patient app) 
 | SA-18 | Support | /support: open a case, add a note, change status | Status changes with history |
 | SA-19 | Notifications | /notifications | Templates and delivery log; email shows as "log" driver (no SMTP) |
 | SA-20 | Settings | /settings every tab: Branding (logo), Email, Payments (Razorpay, Stripe), Push, Provider Portal, Patient App (edit hero title, Popular Searches) | Each tab loads; Patient App save needs a reason and then shows in the patient app (see X-05) |
-| SA-21 | Audit | /audit: filter by actor admin@gmail.com | Shows the changes made in this test session |
+| SA-21 | Audit | /audit: filter by the super-admin account used for testing | Shows the changes made in this test session |
 | SA-22 | Verification queue | /verification | Open cases listed; checks and decision UI work |
 | SA-23 | Change password | /account/password: wrong current password; mismatch; valid change and change back | Clear errors; success toast |
 | SA-24 | Mobile | Every page above at 360 px | Menu opens and closes; tables scroll inside their card; dialogs fit the screen |

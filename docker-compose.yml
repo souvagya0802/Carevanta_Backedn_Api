@@ -1,0 +1,102 @@
+# Local development stack: API + worker + single-node MongoDB replica set (transactions need one) + Redis.
+# Usage:
+#   cp .env.example .env            # then set JWT_SECRET and DATA_ENCRYPTION_KEY (generated, never shared)
+#   docker compose up --build
+# Secrets come only from .env / the shell; nothing here is a real credential. Atlas is used in staging and
+# production — this MongoDB is for laptops and CI only.
+name: carevanta
+
+x-api-env: &api-env
+  APP_ENV: ${APP_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  MONGODB_URI: mongodb://mongo:27017/carevanta?replicaSet=rs0&directConnection=true
+  MONGODB_DB: carevanta
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (>= 32 random chars)}
+  DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env (32 bytes base64)}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001,http://localhost:3002}
+  TRUST_PROXY: ${TRUST_PROXY:-0}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+  GEOCODER_PROVIDER: ${GEOCODER_PROVIDER:-nominatim}
+  GEOCODER_API_KEY: ${GEOCODER_API_KEY:-}
+  GEOCODER_CONTACT_EMAIL: ${GEOCODER_CONTACT_EMAIL:-}
+  RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+  RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+  RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+  PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:4000}
+  STORAGE_DRIVER: local
+  STORAGE_LOCAL_DIR: /data/storage
+  METRICS_ENABLED: ${METRICS_ENABLED:-false}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  OPENAPI_ENABLED: ${OPENAPI_ENABLED:-true}
+
+services:
+  mongo:
+    image: mongo:8.0
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Initiates the single-node replica set on first start, then reports healthy once a primary exists.
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"mongo:27017\"}]}).ok }' | grep -q 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    image: carevanta-api:local
+    environment:
+      <<: *api-env
+      PORT: 4000
+      JOBS_ENABLED: "true"
+    ports:
+      - "4000:4000"
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  worker:
+    image: carevanta-api:local
+    command: ["node", "dist/src/worker.js"]
+    environment:
+      <<: *api-env
+      JOBS_ENABLED: "true"
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  mongo-data:
+  storage:

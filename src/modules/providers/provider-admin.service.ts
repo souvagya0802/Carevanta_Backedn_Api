@@ -19,7 +19,8 @@ export async function setServiceAreas(actor: AuthContext, providerId: string, ar
     if (!(await tx.provider.findUnique({ where: { id: providerId }, select: { id: true } }))) throw notFound('Provider');
     await tx.providerServiceArea.deleteMany({ where: { providerId } });
     const unique = new Map(areas.map((a) => [`${a.purpose}|${a.district}|${a.pincode ?? ''}`, a]));
-    await tx.providerServiceArea.createMany({ data: [...unique.values()].map((a) => ({ providerId, ...a, pincode: a.pincode ?? null })) });
+    // MongoDB refuses an empty insertMany; an empty list simply clears the coverage.
+    if (unique.size) await tx.providerServiceArea.createMany({ data: [...unique.values()].map((a) => ({ providerId, ...a, pincode: a.pincode ?? null })) });
     await audit(tx, { action: 'provider.service_areas_updated', entityType: 'provider', entityId: providerId, actorUserId: actor.userId, metadata: { count: unique.size } });
     return tx.providerServiceArea.findMany({ where: { providerId }, select: { purpose: true, district: true, pincode: true } });
   });
@@ -54,9 +55,18 @@ export async function addMember(actor: AuthContext, providerId: string, input: M
       if (!provider) throw notFound('Provider');
       const user = await tx.user.findUnique({ where: { id: userId } });
       if (!user || user.status === 'ANONYMISED' || user.status === 'DEACTIVATED') throw badRequest('User must be an active account');
-      await tx.providerMember.create({
-        data: { providerId, userId, memberRole: input.memberRole, status: 'ACTIVE', invitedById: actor.userId, joinedAt: new Date() },
-      });
+      // (providerId, userId) is unique: someone removed earlier is re-activated rather than refused as "already a member".
+      const removed = await tx.providerMember.findFirst({ where: { providerId, userId, status: 'REMOVED' }, select: { id: true } });
+      if (removed) {
+        await tx.providerMember.update({
+          where: { id: removed.id },
+          data: { memberRole: input.memberRole, status: 'ACTIVE', invitedById: actor.userId, joinedAt: new Date(), removedAt: null },
+        });
+      } else {
+        await tx.providerMember.create({
+          data: { providerId, userId, memberRole: input.memberRole, status: 'ACTIVE', invitedById: actor.userId, joinedAt: new Date() },
+        });
+      }
       await audit(tx, { action: 'provider.member_added', entityType: 'provider', entityId: providerId, actorUserId: actor.userId, metadata: { userId, memberRole: input.memberRole, invited } });
     });
   } catch (err) {

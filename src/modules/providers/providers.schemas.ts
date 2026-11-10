@@ -76,8 +76,8 @@ export const DoctorProfileInput = z.object({
   registrations: z
     .array(
       z.object({
-        council: z.string().min(3).max(160),
-        registrationNumber: z.string().min(2).max(64),
+        council: z.string().trim().min(3).max(160),
+        registrationNumber: z.string().trim().min(2).max(64),
         registrationYear: z.number().int().min(1950).max(2100).optional(),
         validUntil: DateString.optional(),
       }),

@@ -228,7 +228,8 @@ export async function updateUser(
   const before = await prisma.user.findUnique({ where: { id } });
   if (!before) throw notFound('User');
   if (before.status === 'ANONYMISED') throw conflict('Anonymised accounts cannot be edited');
-  const nextEmail = input.email === undefined ? before.email : input.email;
+  // Addresses are stored lower-case; compare the same way so "Name@x" → "name@x" is not treated as a new, unverified address.
+  const nextEmail = input.email === undefined ? before.email : (input.email?.toLowerCase() ?? null);
   const nextPhone = input.phone === undefined ? before.phone : input.phone;
   if (!nextEmail && !nextPhone) throw badRequest('An account needs an email address or a mobile number');
   try {
@@ -238,7 +239,7 @@ export async function updateUser(
         data: {
           ...(input.fullName !== undefined ? { fullName: input.fullName } : {}),
           ...(input.email !== undefined
-            ? { email: input.email?.toLowerCase() ?? null, emailVerifiedAt: input.email === before.email ? before.emailVerifiedAt : null }
+            ? { email: nextEmail, emailVerifiedAt: nextEmail === before.email ? before.emailVerifiedAt : null }
             : {}),
           ...(input.phone !== undefined
             ? { phone: input.phone, phoneVerifiedAt: input.phone === before.phone ? before.phoneVerifiedAt : null }

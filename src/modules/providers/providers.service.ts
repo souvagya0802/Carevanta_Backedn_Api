@@ -494,8 +494,13 @@ export async function transitionProvider(
     });
   }
   if (to === 'APPROVED' && p.status === 'SUSPENDED') {
+    // Mirror of the suspension above: the doctor's own slots and the slots at this facility's locations.
     await tx.appointmentSlot.updateMany({
       where: { doctorProviderId: providerId, status: 'BLOCKED', startsAt: { gt: now } },
+      data: { status: 'OPEN' },
+    });
+    await tx.appointmentSlot.updateMany({
+      where: { location: { providerId }, status: 'BLOCKED', startsAt: { gt: now } },
       data: { status: 'OPEN' },
     });
   }
@@ -607,7 +612,8 @@ export async function setOperatingHours(
       byDay.set(h.dayOfWeek, list);
     }
     await tx.providerOperatingHours.deleteMany({ where: { locationId } });
-    await tx.providerOperatingHours.createMany({ data: hours.map((h) => ({ locationId, ...h, isClosed: h.isClosed ?? false })) });
+    // MongoDB refuses an empty insertMany; an empty list simply clears the week.
+    if (hours.length) await tx.providerOperatingHours.createMany({ data: hours.map((h) => ({ locationId, ...h, isClosed: h.isClosed ?? false })) });
     await audit(tx, { action: 'provider.hours_updated', entityType: 'provider', entityId: providerId, actorUserId: actor.userId, metadata: { locationId, windows: hours.length } });
   });
 }

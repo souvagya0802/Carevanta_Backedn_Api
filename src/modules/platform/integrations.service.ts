@@ -108,11 +108,12 @@ function transportFor(config: SmtpConfig): Transporter {
   return transport;
 }
 
-export async function sendEmail(to: string, subject: string, text: string): Promise<{ messageId: string }> {
+/** Send one email. `html`, when given, is the rich alternative; `text` is always sent as the plain-text part. */
+export async function sendEmail(to: string, subject: string, text: string, html?: string): Promise<{ messageId: string }> {
   const config = await getSmtpConfig();
   if (!config) throw badRequest('SMTP is not configured');
   if (!config.fromAddress) throw badRequest('SMTP from-address is not configured');
-  const info = await transportFor(config).sendMail({ from: `"${config.fromName.replace(/"/g, '')}" <${config.fromAddress}>`, to, subject, text });
+  const info = await transportFor(config).sendMail({ from: `"${config.fromName.replace(/"/g, '')}" <${config.fromAddress}>`, to, subject, text, ...(html ? { html } : {}) });
   return { messageId: String(info.messageId) };
 }
 

@@ -16,6 +16,8 @@ import { env } from '../../config/env.js';
 import { assertProviderAccess, assertProviderMember, getOwnDoctorProviderId } from '../providers/provider-access.js';
 import { DEFAULT_WORDS, PORTAL_PAGES, PORTAL_TYPES, memberCapabilityMatrix, portalUi } from './portal-ui.js';
 import { getSetting } from '../settings/settings.service.js';
+import { AddMedicineInput, addProviderMedicine, searchMedicines } from '../catalogue/medicines.service.js';
+import { medicineAddLimiter } from '../../middleware/rate-limit.js';
 import { getPushConfig, subscribe as pushSubscribe, unsubscribe as pushUnsubscribe } from '../notifications/push.service.js';
 import { LocationInput, UpdateProviderInput } from '../providers/providers.schemas.js';
 import * as providers from '../providers/providers.service.js';
@@ -70,7 +72,7 @@ export function portalRouter(): Router {
     summary: 'My provider memberships with the capabilities each role grants, plus my own doctor profile if any',
     tags,
     response: z.object({
-      memberships: z.array(z.object({ providerId: z.uuid(), displayName: z.string(), type: z.string(), status: z.string(), isListed: z.boolean(), memberRole: z.string(), capabilities: z.array(z.string()), joinedAt: z.string().nullable() })),
+      memberships: z.array(z.object({ providerId: z.uuid(), displayName: z.string(), type: z.string(), status: z.string(), isListed: z.boolean(), memberRole: z.string(), capabilities: z.array(z.string()), joinedAt: z.string().nullable(), specialities: z.array(z.string()) })),
       ownDoctorProviderId: z.uuid().nullable(),
     }),
     handler: async ({ auth }) => {
@@ -78,8 +80,15 @@ export function portalRouter(): Router {
         prisma.providerMember.findMany({ where: { userId: auth.userId, status: 'ACTIVE' }, include: { provider: { select: { id: true, displayName: true, type: true, status: true, isListed: true } } }, orderBy: { joinedAt: 'asc' } }),
         memberCapabilityMatrix(),
       ]);
+      // A doctor's practice carries its specialities (primary first) so the portal can greet "Dr. X · Cardiologist".
+      const doctorIds = rows.filter((m) => m.provider.type === 'DOCTOR').map((m) => m.provider.id);
+      const specialityRows = doctorIds.length
+        ? await prisma.doctorSpeciality.findMany({ where: { doctorProviderId: { in: doctorIds } }, orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }], select: { doctorProviderId: true, speciality: { select: { name: true } } } })
+        : [];
+      const specialities = new Map<string, string[]>();
+      for (const s of specialityRows) specialities.set(s.doctorProviderId, [...(specialities.get(s.doctorProviderId) ?? []), s.speciality.name]);
       return {
-        memberships: rows.map((m) => ({ providerId: m.provider.id, displayName: m.provider.displayName, type: m.provider.type, status: m.provider.status, isListed: m.provider.isListed, memberRole: m.memberRole, capabilities: [...(matrix[m.memberRole] ?? [])], joinedAt: iso(m.joinedAt) })),
+        memberships: rows.map((m) => ({ providerId: m.provider.id, displayName: m.provider.displayName, type: m.provider.type, status: m.provider.status, isListed: m.provider.isListed, memberRole: m.memberRole, capabilities: [...(matrix[m.memberRole] ?? [])], joinedAt: iso(m.joinedAt), specialities: specialities.get(m.provider.id) ?? [] })),
         ownDoctorProviderId: await getOwnDoctorProviderId(auth),
       };
     },
@@ -629,6 +638,24 @@ export function portalRouter(): Router {
     handler: async ({ params, body, auth }) => {
       await assertProviderAccess(auth, params.providerId, { platformPermission: 'pharmacy.manage', capability: 'manage_inventory' });
       return upsertInventory(auth.userId, params.providerId, body);
+    },
+  });
+
+  defineRoute(r, base, {
+    method: 'post',
+    path: '/medicines',
+    summary: "Add a medicine the catalogue doesn't have",
+    description: 'Usable at once by this and every other pharmacy, and visible to patients (no approval step). Refused when the same name, strength and form already exist.',
+    tags,
+    status: 201,
+    params: P,
+    body: AddMedicineInput,
+    response: Passthrough,
+    middleware: [medicineAddLimiter],
+    handler: async ({ params, body, auth }) => {
+      await assertProviderAccess(auth, params.providerId, { platformPermission: 'pharmacy.manage', capability: 'manage_inventory' });
+      if ((await prisma.provider.findUnique({ where: { id: params.providerId }, select: { type: true } }))?.type !== 'PHARMACY') throw badRequest('Only pharmacies add medicines');
+      return addProviderMedicine(params.providerId, auth.userId, body);
     },
   });
 
@@ -1240,14 +1267,11 @@ export function portalRouter(): Router {
     method: 'get',
     path: '/medicines',
     summary: 'Medicine catalogue to add stock from',
+    description: 'Case-insensitive prefix search over brand name then composition (CDCI codes plus pharmacy-added medicines). At least 2 characters, at most 20 results.',
     tags,
-    query: PaginationQuery.extend({ q: z.string().max(100).optional() }),
+    query: z.object({ q: z.string().trim().min(2).max(100), limit: z.coerce.number().int().min(1).max(20).default(20) }),
     response: Passthrough,
-    handler: async ({ query }) => {
-      const rows = await prisma.medicine.findMany({ where: { isActive: true, ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { genericName: { contains: query.q, mode: 'insensitive' } }] } : {}), ...cursorWhere(query.cursor) }, orderBy: cursorOrderBy(), take: query.limit + 1 });
-      const { items, page } = buildPage(rows, query.limit, (m) => m.createdAt);
-      return { page, items: items.map((m) => ({ id: m.id, name: m.name, genericName: m.genericName, strength: m.strength, dosageForm: m.dosageForm, packSize: m.packSize, manufacturer: m.manufacturer, schedule: m.schedule, requiresPrescription: m.requiresPrescription })) };
-    },
+    handler: async ({ query }) => ({ page: { limit: query.limit, nextCursor: null, hasMore: false }, items: await searchMedicines(query.q, query.limit) }),
   });
 
   defineRoute(r, cat, {

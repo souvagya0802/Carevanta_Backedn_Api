@@ -447,6 +447,20 @@ export const SCHEMA_INDEXES: IndexSpec[] = [
     }
   },
   {
+    collection: "medicines",
+    name: "medicines_search_name_idx",
+    key: {
+      search_name: 1
+    }
+  },
+  {
+    collection: "medicines",
+    name: "medicines_source_idx",
+    key: {
+      source: 1
+    }
+  },
+  {
     collection: "service_transactions",
     name: "service_transactions_reference_key",
     key: {

@@ -245,6 +245,19 @@ model Medicine {
   schedule             MedicineSchedule @default(OTC)
   requiresPrescription Boolean          @default(false) @map("requires_prescription")
   isActive             Boolean          @default(true) @map("is_active")
+  /// CDCI brand identifier (Common Drug Codes for India). Unique when present (partial index in mongo-indexes.ts).
+  code                 String?
+  /// CDCI generic identifier.
+  genericCode          String?          @map("generic_code")
+  /// Active ingredients, e.g. "Paracetamol and Caffeine".
+  composition          String?
+  route                String?
+  /// CDCI | MANUAL | PROVIDER
+  source               String           @default("MANUAL")
+  proposedByProviderId String?          @map("proposed_by_provider_id")
+  proposedByUserId     String?          @map("proposed_by_user_id")
+  /// Lower-case name + composition, used for prefix search.
+  searchName           String?          @map("search_name")
   createdAt            DateTime         @default(now()) @map("created_at")
   updatedAt            DateTime         @updatedAt @map("updated_at")
 
@@ -254,5 +267,7 @@ model Medicine {
   @@unique([name, strength, dosageForm, packSize, manufacturer])
   @@index([name], map: "medicines_name_trgm_idx")
   @@index([genericName])
+  @@index([searchName])
+  @@index([source])
   @@map("medicines")
 }

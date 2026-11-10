@@ -1,8 +1,8 @@
 import { notifyProviderStaff, notifyUsers } from '../notifications/events.js';
 import { prisma, type Tx } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
-import { badRequest, conflict, forbidden, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
-import { assertTransition, type TransitionMap } from '../../lib/state-machine.js';
+import { badRequest, conflict, forbidden, invalidTransition, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
+import { assertTransition, isTerminal, type TransitionMap } from '../../lib/state-machine.js';
 import { buildPage, cursorOrderBy, cursorWhere } from '../../lib/pagination.js';
 import { iso, isoDate, minor } from '../../http/dto.js';
 import type { AuthContext } from '../../middleware/auth.js';
@@ -206,6 +206,8 @@ export async function transition(
   return prisma.$transaction(async (tx) => {
     const a = await tx.doctorAffiliation.findUnique({ where: { id } });
     if (!a) throw notFound('Affiliation');
+    // A closed affiliation answers "cannot move" for every action, before any side-specific precondition.
+    if (isTerminal(AFFILIATION_TRANSITIONS, a.status)) throw invalidTransition('Affiliation', a.status, action);
     let to: AffiliationStatus;
     const now = new Date();
     const extra: Prisma.DoctorAffiliationUpdateManyMutationInput = {};

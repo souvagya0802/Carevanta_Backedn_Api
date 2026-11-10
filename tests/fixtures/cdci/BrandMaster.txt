@@ -1,0 +1,7 @@
+Identifier	Brand Name	Product Identifier	Supplier Identifier	Generic Identifier	License Number	License Status	Excipient	last_updated_on
+9000001	Dolo 650 (paracetamol) 650 mg oral tablet	8001	7001	6001		UNKNOWN		20260101	
+9000002	Paracip (paracetamol) 500 mg oral tablet	8002	7002	6002		UNKNOWN		20260101	
+9000003	Flucret (caffeine and paracetamol) 30 mg + 500 mg oral tablet	8003	7001	6003		UNKNOWN		20260101
+9000004	Covaxin vaccine	8004	7002			UNKNOWN		20260101	
+9000005	Oldbrand (ranitidine) 150 mg oral tablet	8005	7001	6004		WITHDRAWN		20260101	
+9000006	Paramol Kid (paracetamol) 125 mg/5 mL oral suspension	8006	7002	6005		UNKNOWN		20260101	

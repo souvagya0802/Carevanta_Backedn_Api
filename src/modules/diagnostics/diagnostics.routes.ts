@@ -1,4 +1,5 @@
 import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
+import { emailUsers, titleCaseStatus } from '../notifications/email-events.js';
 import express, { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -177,7 +178,7 @@ const DX_PATIENT_MESSAGES: Partial<Record<DiagnosticOrderStatus, { title: string
 
 /** Patient hears about lab-side changes; lab staff hear when the patient cancels. */
 async function notifyDiagnosticChange(tx: Tx, orderId: string, to: DiagnosticOrderStatus, actorUserId: string, reason?: string) {
-  const o = await tx.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, providerId: true, patient: { select: { accountUserId: true, fullName: true } } } });
+  const o = await tx.diagnosticOrder.findUnique({ where: { id: orderId }, select: { reference: true, providerId: true, provider: { select: { type: true } }, patient: { select: { accountUserId: true, fullName: true } } } });
   if (!o) return;
   const meta = { kind: 'diagnostic_order' as const, id: orderId, providerId: o.providerId, status: to };
   if (actorUserId === o.patient.accountUserId) {
@@ -186,6 +187,7 @@ async function notifyDiagnosticChange(tx: Tx, orderId: string, to: DiagnosticOrd
     }
     return;
   }
+  await emailUsers(tx, [o.patient.accountUserId], 'order.status_changed', { reference: o.reference, kind: o.provider.type === 'IMAGING_CENTRE' ? 'Imaging' : 'Lab', status: titleCaseStatus(to) }, actorUserId);
   const m = DX_PATIENT_MESSAGES[to];
   if (!m) return;
   const why = m.level === 'important' && reason ? ` Reason: ${reason}` : '';

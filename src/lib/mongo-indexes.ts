@@ -56,6 +56,8 @@ export const PARTIAL_INDEXES: IndexSpec[] = [
   { collection: 'service_transactions', name: 'service_transactions_completed_at_partial', key: { service_completed_at: 1 }, partialFilterExpression: { service_completed_at: { $type: 'date' } } },
   { collection: 'commission_snapshots', name: 'commission_snapshots_one_live', key: { transaction_id: 1 }, unique: true, partialFilterExpression: { status: { $in: ['PROVISIONAL', 'FINAL'] } } },
   { collection: 'provider_ledger_entries', name: 'ledger_unsettled_by_provider', key: { provider_id: 1, created_at: 1 }, partialFilterExpression: isNull('settlement_item_id') },
+  // medicines: one row per CDCI brand code (manual and provider-proposed rows have no code)
+  { collection: 'medicines', name: 'medicines_code_unique_partial', key: { code: 1 }, unique: true, partialFilterExpression: { code: { $type: 'string' } } },
   // background jobs
   { collection: 'job_leases', name: 'job_leases_locked_until_idx', key: { locked_until: 1 } },
 ];

@@ -1,0 +1,132 @@
+# Continuous integration for the Carevanta API, plus the three Next.js frontends when their repositories are
+# reachable. Nothing here needs a secret for the API job: tests run against an in-memory MongoDB replica set and
+# the test-only JWT/encryption values from vitest.config.ts.
+#
+# Frontends live in sibling repositories (Carevanta_Super_Admin_Dashboard, Carevanta_Provider_Frontend,
+# Carevanta_User_Frontend). The `frontends` job checks each one out with FRONTEND_REPO_TOKEN (a fine-grained PAT
+# with read access to those repositories). Without the token the job is skipped, not failed. The same three steps
+# (install, typecheck + lint, test, build) can be copied into each frontend repository as its own workflow.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22
+  # mongodb-memory-server downloads the mongod binary once; cache it between runs.
+  MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+
+jobs:
+  api:
+    name: API — typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Cache MongoDB binary (tests)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MONGOMS_DOWNLOAD_DIR }}
+          key: mongoms-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: mongoms-${{ runner.os }}-
+      - name: Install (runs prisma generate + index manifest)
+        run: npm ci
+      - name: Generated manifests are up to date
+        run: node scripts/generate-index-manifest.mjs --check
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Integration tests (in-memory MongoDB replica set)
+        run: npm run test:integration
+      - name: Build
+        run: npm run build
+      - name: Dependency audit (high and critical only)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+  docker:
+    name: API — container image builds
+    runs-on: ubuntu-latest
+    needs: api
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: carevanta-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Image starts as non-root and serves /health/live
+        run: |
+          docker run -d --name api -p 4000:4000 \
+            -e APP_ENV=development -e MONGODB_URI=mongodb://127.0.0.1:27017/ci \
+            -e JWT_SECRET=ci-only-jwt-secret-not-for-any-real-environment-0123456789 \
+            -e DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            carevanta-api:ci
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:4000/health/live && break; sleep 1; done
+          test "$(docker exec api id -u)" != "0"
+          docker logs api | tail -20
+          docker rm -f api
+
+  frontend-token:
+    name: Frontend repositories reachable?
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - id: check
+        run: echo "available=${{ secrets.FRONTEND_REPO_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+  frontends:
+    name: ${{ matrix.app.name }} — typecheck, lint, test, build
+    needs: frontend-token
+    if: needs.frontend-token.outputs.available == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - { name: Super Admin Dashboard, repo: souvagya0802/Carevanta_Super_Admin_Dashboard }
+          - { name: Provider Portal, repo: souvagya0802/Carevanta_Provider_Frontend }
+          - { name: Patient App, repo: souvagya0802/Carevanta_User_Frontend }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.app.repo }}
+          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXT_PUBLIC_API_URL: http://localhost:4000

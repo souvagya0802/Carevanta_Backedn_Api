@@ -8,6 +8,8 @@ import { buildPage, cursorOrderBy, cursorWhere, PaginationQuery } from '../../li
 import { MoneyInput, SearchText } from '../../http/dto.js';
 import { listOfferings, upsertOffering } from '../providers/provider-admin.service.js';
 import { clearSearchVocabulary } from '../discovery/smart-search.js';
+import { searchKey } from './cdci-parse.js';
+import type { Medicine } from '../../../generated/prisma/client.js';
 
 /** Everyday words patients type for a speciality or test. Lowercase, de-duplicated. */
 const Synonyms = z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).transform((xs) => [...new Set(xs)]);
@@ -533,11 +535,19 @@ export function catalogueRouter(): Router {
     dosageForm: z.string().nullable(),
     packSize: z.string().nullable(),
     manufacturer: z.string().nullable(),
+    composition: z.string().nullable(),
+    route: z.string().nullable(),
+    code: z.string().nullable(),
+    source: z.string(),
+    proposedByProviderId: z.string().nullable(),
     schedule: z.string(),
     requiresPrescription: z.boolean(),
     isActive: z.boolean(),
     createdAt: z.string(),
   });
+  const medicineDto = (m: Medicine) => ({ ...m, createdAt: m.createdAt.toISOString(), updatedAt: undefined });
+  const ScheduleEnum = z.enum(['OTC', 'SCHEDULE_G', 'SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X', 'OTHER']);
+  const RX_SCHEDULES = ['SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X'];
 
   defineRoute(r, base, {
     kind: 'list',
@@ -546,11 +556,12 @@ export function catalogueRouter(): Router {
     summary: 'Medicine catalogue',
     tags,
     permissions: ['catalogue.read'],
-    query: PaginationQuery.extend({ q: SearchText.optional() }),
+    query: PaginationQuery.extend({ q: SearchText.optional(), source: z.enum(['CDCI', 'MANUAL', 'PROVIDER']).optional() }),
     response: MedicineDto,
     handler: async ({ query }) => {
       const rows = await prisma.medicine.findMany({
         where: {
+          ...(query.source ? { source: query.source } : {}),
           ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { genericName: { contains: query.q, mode: 'insensitive' } }] } : {}),
           ...cursorWhere(query.cursor),
         },
@@ -558,7 +569,7 @@ export function catalogueRouter(): Router {
         take: query.limit + 1,
       });
       const { items, page } = buildPage(rows, query.limit, (m) => m.createdAt);
-      return { items: items.map((m) => ({ ...m, createdAt: m.createdAt.toISOString(), updatedAt: undefined })), page };
+      return { items: items.map(medicineDto), page };
     },
   });
 
@@ -576,18 +587,64 @@ export function catalogueRouter(): Router {
       dosageForm: z.string().max(64).optional(),
       packSize: z.string().max(64).optional(),
       manufacturer: z.string().max(160).optional(),
-      schedule: z.enum(['OTC', 'SCHEDULE_G', 'SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X', 'OTHER']).default('OTC'),
+      composition: z.string().max(300).optional(),
+      schedule: ScheduleEnum.default('OTC'),
       requiresPrescription: z.boolean().default(false),
     }),
     response: MedicineDto,
     handler: async ({ body }) => {
-      const requiresPrescription = body.requiresPrescription || ['SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X'].includes(body.schedule);
+      const requiresPrescription = body.requiresPrescription || RX_SCHEDULES.includes(body.schedule);
       return uniqueGuard(
         () =>
           prisma.$transaction(async (tx) => {
-            const m = await tx.medicine.create({ data: { ...body, requiresPrescription } });
+            const m = await tx.medicine.create({ data: { ...body, requiresPrescription, source: 'MANUAL', searchName: searchKey(body.name, body.composition) } });
             await audit(tx, { action: 'catalogue.medicine_created', entityType: 'medicine', entityId: m.id, metadata: { schedule: m.schedule } });
-            return { ...m, createdAt: m.createdAt.toISOString(), updatedAt: undefined };
+            return medicineDto(m);
+          }),
+        'This medicine',
+      );
+    },
+  });
+
+  defineRoute(r, base, {
+    method: 'patch',
+    path: '/medicines/:id',
+    summary: 'Edit a medicine (for example a pharmacy-added one, or a CDCI row whose schedule is known)',
+    description: 'A CDCI re-import refreshes names but never overwrites schedule, requiresPrescription or isActive set here.',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: z.object({ id: z.uuid() }),
+    body: z
+      .object({
+        name: z.string().trim().min(2).max(200),
+        composition: z.string().trim().max(300).nullable(),
+        genericName: z.string().max(200).nullable(),
+        strength: z.string().max(64).nullable(),
+        dosageForm: z.string().max(64).nullable(),
+        packSize: z.string().max(64).nullable(),
+        manufacturer: z.string().max(160).nullable(),
+        schedule: ScheduleEnum,
+        requiresPrescription: z.boolean(),
+        isActive: z.boolean(),
+        reason: z.string().trim().min(3).max(500),
+      })
+      .partial()
+      .required({ reason: true }),
+    response: MedicineDto,
+    handler: async ({ params, body }) => {
+      const { reason, ...changes } = body;
+      return uniqueGuard(
+        () =>
+          prisma.$transaction(async (tx) => {
+            const before = await tx.medicine.findUnique({ where: { id: params.id } });
+            if (!before) throw notFound('Medicine');
+            const schedule = changes.schedule ?? before.schedule;
+            const requiresPrescription = (changes.requiresPrescription ?? before.requiresPrescription) || RX_SCHEDULES.includes(schedule);
+            const name = changes.name ?? before.name;
+            const composition = changes.composition === undefined ? before.composition : changes.composition;
+            const m = await tx.medicine.update({ where: { id: params.id }, data: { ...changes, requiresPrescription, searchName: searchKey(name, composition) } });
+            await audit(tx, { action: 'catalogue.medicine_updated', entityType: 'medicine', entityId: m.id, metadata: { reason, fields: Object.keys(changes), source: m.source } });
+            return medicineDto(m);
           }),
         'This medicine',
       );

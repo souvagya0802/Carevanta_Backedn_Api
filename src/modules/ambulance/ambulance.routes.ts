@@ -1,4 +1,5 @@
 import { notifyProviderStaffMany, notifyUsers, notifyUsersWithPermission, type NoticeLevel } from '../notifications/events.js';
+import { emailUsers, titleCaseStatus } from '../notifications/email-events.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { defineRoute, IdParams } from '../../http/route.js';
@@ -41,6 +42,8 @@ export const DISPATCH_TRANSITIONS: TransitionMap<DispatchStatus> = {
 
 const Passthrough = z.object({ id: z.uuid() }).passthrough();
 
+const DISPATCH_QUIET: readonly DispatchStatus[] = ['RECEIVED', 'SEARCHING', 'OFFERED'];
+
 async function moveDispatch(tx: Tx, id: string, to: DispatchStatus, actor: { userId: string | null; kind: string }, note?: string) {
   const d = await tx.dispatchRequest.findUnique({ where: { id } });
   if (!d) throw notFound('Dispatch request');
@@ -57,6 +60,8 @@ async function moveDispatch(tx: Tx, id: string, to: DispatchStatus, actor: { use
   if (res.count !== 1) throw conflict('The request changed concurrently');
   await tx.dispatchEvent.create({ data: { requestId: id, fromStatus: d.status, toStatus: to, actorUserId: actor.userId, actorKind: actor.kind, note } });
   await notifyDispatchChange(tx, { id, reference: d.reference, requestedByUserId: d.requestedByUserId }, to);
+  // The requester is emailed on every step that matters to them (not the seconds-long search/offer phase).
+  if (!DISPATCH_QUIET.includes(to)) await emailUsers(tx, [d.requestedByUserId], 'dispatch.status_changed', { reference: d.reference, status: titleCaseStatus(to) }, actor.userId);
   return d;
 }
 

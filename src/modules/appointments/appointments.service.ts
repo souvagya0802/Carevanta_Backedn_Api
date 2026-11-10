@@ -1,7 +1,8 @@
 import { notifyProviderStaff, notifyUsers, type NoticeLevel } from '../notifications/events.js';
-import { prisma, transactionWithRetry, type Tx } from '../../lib/prisma.js';
+import { isDuplicateKey, prisma, transactionWithRetry, type Tx } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
-import { AppError, badRequest, conflict, isPgError, notFound, preconditionFailed } from '../../lib/errors.js';
+import { AppError, badRequest, conflict, notFound, preconditionFailed } from '../../lib/errors.js';
+import { withSlotLock } from '../../lib/slot-lock.js';
 import { assertTransition, type TransitionMap } from '../../lib/state-machine.js';
 import { makeReference, REF } from '../../lib/reference.js';
 import { buildPage, cursorOrderBy, cursorWhere } from '../../lib/pagination.js';
@@ -9,6 +10,7 @@ import { iso, minor } from '../../http/dto.js';
 import { formatIst } from '../../lib/time.js';
 import { getSetting } from '../settings/settings.service.js';
 import { enqueueNotification } from '../notifications/notifications.service.js';
+import { emailProviderStaff, emailUsers } from '../notifications/email-events.js';
 import { createTransaction, onServiceCompleted, onSourceCancelled } from '../finance/commission.service.js';
 import type { AppointmentStatus, Attribution, BookingSource, Prisma } from '../../../generated/prisma/client.js';
 
@@ -121,6 +123,8 @@ export interface BookingInput {
   idempotencyKey?: string;
   actorKind: 'PATIENT' | 'PROVIDER' | 'PLATFORM';
   rescheduledFromId?: string;
+  /** Who performed the booking when not the booker (a reschedule by staff); never emailed about it. */
+  actorUserId?: string;
 }
 
 async function bookInTx(tx: Tx, input: BookingInput) {
@@ -195,18 +199,48 @@ async function bookInTx(tx: Tx, input: BookingInput) {
     link: `/appointments?id=${appt.id}`,
     exceptUserId: input.actorKind === 'PROVIDER' ? input.bookedByUserId : null,
   });
+  // A request waiting for confirmation is also emailed to the same staff.
+  if (status === 'REQUESTED') {
+    await emailProviderStaff(tx, slot.location.providerId, 'manage_bookings', 'booking.requested', {
+      patientName: patient.fullName, reference: appt.reference, when: formatIst(slot.startsAt), doctorName: slot.doctor.displayName,
+    }, input.actorUserId ?? input.bookedByUserId);
+  }
   return appt.id;
 }
 
+/**
+ * Cheap read used while a caller waits for the slot lock: once the slot is full (or closed, or too close
+ * to start) there is nothing to queue for, so the waiter fails at once with SLOT_UNAVAILABLE instead of
+ * holding its place until the lock times out. A missing slot returns true so the caller reaches the
+ * proper 404 inside the transaction.
+ */
+async function slotStillHasRoom(slotId: string, walkIn: boolean): Promise<boolean> {
+  const slot = await prisma.appointmentSlot.findUnique({ where: { id: slotId }, select: { status: true, bookedCount: true, capacity: true, startsAt: true, endsAt: true } });
+  if (!slot) return true;
+  const now = Date.now();
+  const timeOk = walkIn ? slot.endsAt.getTime() > now : slot.startsAt.getTime() > now + MIN_LEAD_MS;
+  return slot.status === 'OPEN' && slot.bookedCount < slot.capacity && timeOk;
+}
+
+/**
+ * Book a slot. Concurrent bookings of the same slot queue on the per-slot lock (Redis across
+ * instances, in-process otherwise) so one patient at a time runs the transaction; the version
+ * compare-and-set in `claimSlot` is still the final guarantee against over-booking.
+ * MongoDB's partial unique index `appointments_patient_slot_live` (one live booking per patient per
+ * slot) surfaces as a duplicate key, which maps to 409.
+ */
 export async function book(input: BookingInput): Promise<string> {
-  try {
-    return await transactionWithRetry((tx) => bookInTx(tx, input));
-  } catch (err) {
-    if (isPgError(err, '23505')) {
-      throw conflict('This patient already has a booking for this slot (or this request was already processed)');
+  const walkIn = input.source === 'WALK_IN';
+  return withSlotLock(input.slotId, async () => {
+    try {
+      return await transactionWithRetry((tx) => bookInTx(tx, input));
+    } catch (err) {
+      if (isDuplicateKey(err)) {
+        throw conflict('This patient already has a booking for this slot (or this request was already processed)');
+      }
+      throw err;
     }
-    throw err;
-  }
+  }, { stillWorthWaiting: () => slotStillHasRoom(input.slotId, walkIn) });
 }
 
 export type AppointmentAction = 'CONFIRM' | 'REJECT' | 'CHECK_IN' | 'COMPLETE' | 'NO_SHOW' | 'CANCEL';
@@ -285,14 +319,12 @@ export async function act(
 
     const holder = await tx.patientProfile.findUniqueOrThrow({ where: { id: a.patientProfileId }, include: { accountHolder: true } });
     const phone = holder.accountHolder.phone;
-    if (phone && (to === 'CONFIRMED' || to.startsWith('CANCELLED') || to === 'REJECTED')) {
-      await enqueueNotification(tx, {
-        userId: holder.accountUserId,
-        channel: 'SMS',
-        templateKey: to === 'CONFIRMED' ? 'booking.confirmed' : 'booking.cancelled',
-        recipient: phone,
-        payload: { reference: a.reference, when: formatIst(a.slot.startsAt) },
-      });
+    if (to === 'CONFIRMED' || to.startsWith('CANCELLED') || to === 'REJECTED') {
+      const templateKey = to === 'CONFIRMED' ? 'booking.confirmed' : 'booking.cancelled';
+      const doctor = await tx.provider.findUnique({ where: { id: a.doctorProviderId }, select: { displayName: true } });
+      const payload = { reference: a.reference, when: formatIst(a.slot.startsAt), doctorName: doctor?.displayName ?? '' };
+      if (phone) await enqueueNotification(tx, { userId: holder.accountUserId, channel: 'SMS', templateKey, recipient: phone, payload });
+      await emailUsers(tx, [holder.accountUserId], templateKey, payload, actor.userId);
     }
     // Tell the patient in the app (and by push when enabled) whenever someone else changes the booking.
     if (actor.kind !== 'PATIENT') await notifyPatientOfChange(tx, a, to, reason);
@@ -348,6 +380,15 @@ async function notifyPatientOfChange(
  * single transaction, so the patient never holds zero or two live bookings.
  */
 export async function reschedule(id: string, newSlotId: string, actor: { userId: string; kind: 'PATIENT' | 'PROVIDER' | 'PLATFORM' }) {
+  // The new slot is what competes with other bookings, so that is what the lock covers (releasing the old
+  // slot is a plain decrement). The source is read up front only to pick the right "still has room" rule.
+  const existing = await prisma.appointment.findUnique({ where: { id }, select: { source: true } });
+  if (!existing) throw notFound('Appointment');
+  const walkIn = existing.source === 'WALK_IN';
+  return withSlotLock(newSlotId, () => rescheduleLocked(id, newSlotId, actor), { stillWorthWaiting: () => slotStillHasRoom(newSlotId, walkIn) });
+}
+
+async function rescheduleLocked(id: string, newSlotId: string, actor: { userId: string; kind: 'PATIENT' | 'PROVIDER' | 'PLATFORM' }) {
   try {
     return await transactionWithRetry(async (tx) => {
       const a = await tx.appointment.findUnique({ where: { id }, include: { transaction: true } });
@@ -373,6 +414,7 @@ export async function reschedule(id: string, newSlotId: string, actor: { userId:
         payAtProvider: a.transaction?.status === 'PAY_AT_PROVIDER',
         actorKind: actor.kind,
         rescheduledFromId: a.id,
+        actorUserId: actor.userId,
       });
       // Carry any payment over: move payments to the new transaction.
       if (a.transaction) {
@@ -382,6 +424,12 @@ export async function reschedule(id: string, newSlotId: string, actor: { userId:
         await tx.serviceTransaction.update({ where: { id: a.transaction.id }, data: { status: 'CANCELLED', eligibilityReason: 'Rescheduled' } });
       }
       await audit(tx, { action: 'appointment.rescheduled', entityType: 'appointment', entityId: id, actorUserId: actor.userId, metadata: { newAppointmentId: newId, newSlotId } });
+      const [holder, doctor, moved] = await Promise.all([
+        tx.patientProfile.findUnique({ where: { id: a.patientProfileId }, select: { accountUserId: true } }),
+        tx.provider.findUnique({ where: { id: a.doctorProviderId }, select: { displayName: true } }),
+        tx.appointment.findUniqueOrThrow({ where: { id: newId }, select: { reference: true } }),
+      ]);
+      if (holder) await emailUsers(tx, [holder.accountUserId], 'booking.rescheduled', { reference: moved.reference, when: formatIst(newSlot.startsAt), doctorName: doctor?.displayName ?? '' }, actor.userId);
       if (actor.kind !== 'PATIENT') await notifyPatientOfChange(tx, { ...a, id: newId, slot: newSlot }, 'RESCHEDULED');
       else {
         await notifyProviderStaff(tx, a.facilityProviderId, 'manage_bookings', {
@@ -397,7 +445,7 @@ export async function reschedule(id: string, newSlotId: string, actor: { userId:
       return newId;
     });
   } catch (err) {
-    if (isPgError(err, '23505')) throw conflict('The patient already holds a booking in the new slot');
+    if (isDuplicateKey(err)) throw conflict('The patient already holds a booking in the new slot');
     throw err;
   }
 }

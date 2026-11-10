@@ -10,6 +10,7 @@ import { prisma } from './lib/prisma.js';
 import { runWithRequestContext } from './lib/request-context.js';
 import { errorHandler, notFoundHandler } from './middleware/error-handler.js';
 import { globalLimiter } from './middleware/rate-limit.js';
+import { metricsMiddleware, renderMetrics } from './middleware/metrics.js';
 import { generateOpenApiDocument } from './http/openapi.js';
 import { apiRouter } from './routes.js';
 import { webhookRouter } from './modules/finance/webhooks.routes.js';
@@ -105,8 +106,28 @@ export function createApp(): Express {
   // Webhooks need the raw body for signature verification — mount before JSON parser.
   app.use('/api/v1/webhooks', express.raw({ type: 'application/json', limit: '256kb' }), webhookRouter());
 
+  app.use(metricsMiddleware);
   app.use(express.json({ limit: '256kb', strict: true }));
   app.use(globalLimiter);
+
+  // API responses carry personal and clinical data: never cacheable by default. Handlers that serve public,
+  // cacheable material (reference geography, branding logo) set their own Cache-Control, which replaces this.
+  app.use('/api/v1', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+
+  if (env.METRICS_ENABLED) {
+    app.get('/metrics', (req, res) => {
+      if (env.METRICS_TOKEN && req.headers.authorization !== `Bearer ${env.METRICS_TOKEN}`) {
+        res.status(401).json({ error: { code: 'UNAUTHENTICATED', message: 'Authentication required' } });
+        return;
+      }
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(renderMetrics());
+    });
+  }
 
   const v1 = Router();
   v1.use(apiRouter());
