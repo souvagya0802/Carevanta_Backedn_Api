@@ -3,7 +3,7 @@
  * and subscriptions, and the in-app/push notifications that business events
  * fan out to provider staff.
  */
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { prisma } from '../../src/lib/prisma.js';
 import { resetDatabase } from '../helpers/db.js';
@@ -13,7 +13,23 @@ import { verifyStripeSignature } from '../../src/modules/finance/gateway.js';
 import { invalidatePaymentConfig } from '../../src/modules/finance/payment-config.service.js';
 import { invalidatePushConfig } from '../../src/modules/notifications/push.service.js';
 
-beforeAll(resetDatabase);
+// Platform settings survive resetDatabase and test files share one database. This file stores payment and
+// push keys (including a Razorpay webhook secret, which would make later files' signed test webhooks fail),
+// so it puts those settings back exactly as it found them.
+const OWN_SETTINGS = { OR: [{ key: { startsWith: 'payments.' } }, { key: { startsWith: 'push.' } }] };
+let settingsBefore: Awaited<ReturnType<typeof prisma.platformSetting.findMany>> = [];
+beforeAll(async () => {
+  await resetDatabase();
+  settingsBefore = await prisma.platformSetting.findMany({ where: OWN_SETTINGS });
+});
+afterAll(async () => {
+  await prisma.platformSetting.deleteMany({ where: { ...OWN_SETTINGS, key: { notIn: settingsBefore.map((s) => s.key) } } });
+  for (const s of settingsBefore) {
+    await prisma.platformSetting.update({ where: { key: s.key }, data: { value: s.value as object, isSensitive: s.isSensitive, version: s.version } });
+  }
+  invalidatePaymentConfig();
+  invalidatePushConfig();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 const V = '/api/v1';
