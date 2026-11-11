@@ -21,6 +21,10 @@ generator client {
   // Emit `.js` import specifiers so `tsc` output runs under Node's NodeNext
   // resolution without a bundler.
   importFileExtension = "js"
+  // "native" for the developer's machine; debian-openssl-3.0.x for the Docker
+  // image (node:22-bookworm-slim ships OpenSSL 3), so the right query engine is
+  // always generated even if OpenSSL detection fails during the image build.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {

@@ -12,6 +12,11 @@ COPY package.json package-lock.json .npmrc ./
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 COPY scripts/generate-index-manifest.mjs ./scripts/
+# OpenSSL must be present when `prisma generate` runs, or Prisma assumes OpenSSL 1.1
+# and ships an engine the OpenSSL 3 runtime image cannot load.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p src/lib && npm ci
 
 # ── 2. Compile TypeScript (src + generated Prisma client + scripts) into dist/ ──
