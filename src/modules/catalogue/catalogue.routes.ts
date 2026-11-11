@@ -343,13 +343,73 @@ export function catalogueRouter(): Router {
   });
 
   defineRoute(r, base, {
+    method: 'patch',
+    path: '/departments/:id',
+    summary: 'Edit or deactivate a department',
+    description: 'The code is permanent (facilities and affiliations refer to it). A deactivated department cannot be newly assigned; facilities that already list it keep it.',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: IdParams,
+    body: z
+      .object({ name: z.string().trim().min(2).max(120).optional(), specialityCode: Code.nullable().optional(), isActive: z.boolean().optional() })
+      .strict()
+      .refine((b) => Object.keys(b).length > 0, 'Nothing to change'),
+    response: z.object({ id: z.uuid(), code: z.string(), name: z.string(), specialityCode: z.string().nullable(), isActive: z.boolean() }),
+    handler: async ({ params, body }) => {
+      let specialityId: string | null | undefined;
+      if (body.specialityCode === null) specialityId = null;
+      else if (body.specialityCode) {
+        const spec = await prisma.speciality.findUnique({ where: { code: body.specialityCode } });
+        if (!spec) throw badRequest('Unknown speciality');
+        specialityId = spec.id;
+      }
+      return uniqueGuard(
+        () =>
+          prisma.$transaction(async (tx) => {
+            if (!(await tx.department.findUnique({ where: { id: params.id } }))) throw notFound('Department');
+            const d = await tx.department.update({
+              where: { id: params.id },
+              data: { ...(body.name !== undefined ? { name: body.name } : {}), ...(specialityId !== undefined ? { specialityId } : {}), ...(body.isActive !== undefined ? { isActive: body.isActive } : {}) },
+              include: { speciality: { select: { code: true } } },
+            });
+            await audit(tx, { action: 'catalogue.department_updated', entityType: 'department', entityId: d.id, metadata: body });
+            return { id: d.id, code: d.code, name: d.name, specialityCode: d.speciality?.code ?? null, isActive: d.isActive };
+          }),
+        'A department',
+      );
+    },
+  });
+
+  defineRoute(r, base, {
     method: 'get',
     path: '/amenities',
     summary: 'List facility amenities',
     tags,
     permissions: ['catalogue.read'],
-    response: z.array(z.object({ id: z.uuid(), code: z.string(), name: z.string(), category: z.string() })),
-    handler: async () => prisma.amenity.findMany({ orderBy: [{ category: 'asc' }, { name: 'asc' }], select: { id: true, code: true, name: true, category: true } }),
+    response: z.array(z.object({ id: z.uuid(), code: z.string(), name: z.string(), category: z.string(), isActive: z.boolean() })),
+    handler: async () => prisma.amenity.findMany({ orderBy: [{ category: 'asc' }, { name: 'asc' }], select: { id: true, code: true, name: true, category: true, isActive: true } }),
+  });
+
+  defineRoute(r, base, {
+    method: 'patch',
+    path: '/amenities/:id',
+    summary: 'Edit or deactivate an amenity',
+    description: 'The code is permanent. A deactivated amenity cannot be newly assigned and is no longer offered to providers; providers that already list it keep it.',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: IdParams,
+    body: z
+      .object({ name: z.string().trim().min(2).max(120).optional(), category: z.string().trim().min(2).max(48).optional(), isActive: z.boolean().optional() })
+      .strict()
+      .refine((b) => Object.keys(b).length > 0, 'Nothing to change'),
+    response: z.object({ id: z.uuid(), code: z.string(), name: z.string(), category: z.string(), isActive: z.boolean() }),
+    handler: async ({ params, body }) =>
+      prisma.$transaction(async (tx) => {
+        if (!(await tx.amenity.findUnique({ where: { id: params.id } }))) throw notFound('Amenity');
+        const a = await tx.amenity.update({ where: { id: params.id }, data: body });
+        await audit(tx, { action: 'catalogue.amenity_updated', entityType: 'amenity', entityId: a.id, metadata: body });
+        return { id: a.id, code: a.code, name: a.name, category: a.category, isActive: a.isActive };
+      }),
   });
 
   defineRoute(r, base, {

@@ -144,6 +144,7 @@ model Amenity {
   code      String   @unique
   name      String
   category  String
+  isActive  Boolean  @default(true) @map("is_active")
   createdAt DateTime @default(now()) @map("created_at")
 
   providers ProviderAmenity[]

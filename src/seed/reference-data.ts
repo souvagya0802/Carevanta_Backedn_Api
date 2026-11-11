@@ -11,10 +11,8 @@ import { CONDITION_TERMS, EXTRA_CONDITIONS, SERVICE_TERMS, SPECIALITY_TERMS, mer
  * console before it influences patient-facing results.
  */
 
-const REGIONS = [
-  { code: 'WB-PMD-MOYNA', name: 'Moyna', district: 'Purba Medinipur', state: 'West Bengal', status: 'PILOT' as const },
-  { code: 'WB-PMD-TAMLUK', name: 'Tamluk', district: 'Purba Medinipur', state: 'West Bengal', status: 'PILOT' as const },
-];
+// No service regions are seeded: geography is data, created by a super-admin in
+// Settings → Service Regions on each environment.
 
 const SPECIALITIES: Array<{ code: string; name: string; parent?: string }> = [
   { code: 'GENERAL_MEDICINE', name: 'General Medicine' },
@@ -188,19 +186,15 @@ const SETTINGS: Array<{ key: string; value: unknown; description: string }> = [
 export async function seedReferenceData(db: PrismaClient): Promise<void> {
   await syncAccessControl(db);
 
-  for (const r of REGIONS) {
-    await db.serviceRegion.upsert({ where: { code: r.code }, create: r, update: { name: r.name, district: r.district, state: r.state } });
-  }
-
   for (const s of SPECIALITIES.filter((x) => !x.parent)) {
-    await db.speciality.upsert({ where: { code: s.code }, create: { code: s.code, name: s.name }, update: { name: s.name } });
+    await db.speciality.upsert({ where: { code: s.code }, create: { code: s.code, name: s.name }, update: {} }); // insert only: admin renames survive a re-seed
   }
   for (const s of SPECIALITIES.filter((x) => x.parent)) {
     const parent = await db.speciality.findUniqueOrThrow({ where: { code: s.parent! } });
     await db.speciality.upsert({
       where: { code: s.code },
       create: { code: s.code, name: s.name, parentId: parent.id },
-      update: { name: s.name, parentId: parent.id },
+      update: {}, // insert only: admin edits survive a re-seed
     });
   }
   for (const sp of await db.speciality.findMany({ select: { id: true, code: true, synonyms: true } })) {
@@ -239,11 +233,13 @@ export async function seedReferenceData(db: PrismaClient): Promise<void> {
     await db.department.upsert({
       where: { code },
       create: { code, name, specialityId: spec ? specByCode.get(spec) ?? null : null },
-      update: { name },
+      update: {}, // insert only: admin edits survive a re-seed
     });
   }
+  // Amenities created before the active flag existed have no is_active field; mark them active.
+  await db.$runCommandRaw({ update: 'amenities', updates: [{ q: { is_active: { $exists: false } }, u: { $set: { is_active: true } }, multi: true }] });
   for (const [code, name, category] of AMENITIES) {
-    await db.amenity.upsert({ where: { code }, create: { code, name, category }, update: { name, category } });
+    await db.amenity.upsert({ where: { code }, create: { code, name, category }, update: {} }); // insert only: admin edits survive a re-seed
   }
   for (const s of SERVICES) {
     const data = {
@@ -255,7 +251,7 @@ export async function seedReferenceData(db: PrismaClient): Promise<void> {
       preparationInstructions: s.prep ?? null,
       requiresPrescription: s.rx ?? false,
     };
-    const svc = await db.service.upsert({ where: { code: s.code }, create: { code: s.code, ...data, synonyms: mergeTerms([], SERVICE_TERMS[s.code]) }, update: data });
+    const svc = await db.service.upsert({ where: { code: s.code }, create: { code: s.code, ...data, synonyms: mergeTerms([], SERVICE_TERMS[s.code]) }, update: {} }); // insert only: admin edits survive a re-seed
     const merged = mergeTerms(svc.synonyms, SERVICE_TERMS[s.code]);
     if (merged.length !== svc.synonyms.length) await db.service.update({ where: { id: svc.id }, data: { synonyms: merged } });
   }

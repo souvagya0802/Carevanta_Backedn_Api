@@ -60,7 +60,7 @@ describe('provider portal — scheduling and reference lists', () => {
 
   it('serves reference lists to any signed-in provider user without platform permissions', async () => {
     const plain = await actor([]);
-    for (const path of ['/portal/catalogue/services?category=DIAGNOSTIC_TEST', '/portal/catalogue/medicines', '/portal/catalogue/departments', '/portal/catalogue/amenities', '/portal/catalogue/regions']) {
+    for (const path of ['/portal/catalogue/services?category=DIAGNOSTIC_TEST', '/portal/catalogue/medicines?q=pa','/portal/catalogue/departments', '/portal/catalogue/amenities', '/portal/catalogue/regions']) {
       const res = await plain.get(`/api/v1${path}`);
       expect(res.status, path).toBe(200);
       expect(Array.isArray(res.body.data)).toBe(true);

@@ -505,6 +505,28 @@ export function platformRouter(): Router {
   });
 
   defineRoute(r, '/admin/regions', {
+    method: 'patch',
+    path: '/:id',
+    summary: 'Edit a region',
+    description: 'Name, district and state can be corrected. The code is permanent because provider locations refer to it.',
+    tags: ['Admin · Regions'],
+    permissions: ['regions.manage'],
+    params: IdParams,
+    body: z
+      .object({ name: z.string().trim().min(2).max(120).optional(), district: z.string().trim().min(2).max(80).optional(), state: z.string().trim().min(2).max(80).optional() })
+      .strict()
+      .refine((b) => Object.keys(b).length > 0, 'Nothing to change'),
+    response: RegionDto,
+    handler: async ({ params, body }) => {
+      const x = await prisma.serviceRegion.findUnique({ where: { id: params.id } });
+      if (!x) throw notFound('Region');
+      const u = await prisma.serviceRegion.update({ where: { id: x.id }, data: body, include: { _count: { select: { locations: true } } } });
+      await audit(prisma, { action: 'region.updated', entityType: 'service_region', entityId: x.id, metadata: { code: x.code, ...body } });
+      return regionDto(u);
+    },
+  });
+
+  defineRoute(r, '/admin/regions', {
     method: 'post',
     path: '/:id/status',
     summary: 'Change region rollout status',

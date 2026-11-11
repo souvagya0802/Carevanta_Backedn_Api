@@ -96,8 +96,12 @@ export async function setDepartments(actor: AuthContext, providerId: string, dep
     const p = await tx.provider.findUnique({ where: { id: providerId } });
     if (!p) throw notFound('Provider');
     if (p.type !== 'HOSPITAL' && p.type !== 'CLINIC') throw badRequest('Departments apply to hospitals and clinics only');
-    const depts = await tx.department.findMany({ where: { code: { in: departmentCodes }, isActive: true } });
+    const depts = await tx.department.findMany({ where: { code: { in: departmentCodes } } });
     if (depts.length !== new Set(departmentCodes).size) throw badRequest('Unknown department code');
+    // A deactivated department can be kept by a facility that already lists it, but not newly added.
+    const listed = new Set((await tx.facilityDepartment.findMany({ where: { providerId: p.id, isActive: true }, select: { departmentId: true } })).map((f) => f.departmentId));
+    const retired = depts.find((d) => !d.isActive && !listed.has(d.id));
+    if (retired) throw badRequest(`Department ${retired.name} is no longer offered`);
     const keep = new Set(depts.map((d) => d.id));
     await tx.facilityDepartment.updateMany({ where: { providerId: p.id, departmentId: { notIn: [...keep] } }, data: { isActive: false } });
     for (const d of depts) {
@@ -116,8 +120,11 @@ export async function setAmenities(actor: AuthContext, providerId: string, ameni
     if (!(await tx.provider.findUnique({ where: { id: providerId }, select: { id: true } }))) throw notFound('Provider');
     const items = await tx.amenity.findMany({ where: { code: { in: amenityCodes } } });
     if (items.length !== new Set(amenityCodes).size) throw badRequest('Unknown amenity code');
-    await tx.providerAmenity.deleteMany({ where: { providerId, amenityId: { notIn: items.map((i) => i.id) } } });
     const present = new Set((await tx.providerAmenity.findMany({ where: { providerId }, select: { amenityId: true } })).map((a) => a.amenityId));
+    // A deactivated amenity can be kept by a provider that already lists it, but not newly added.
+    const retired = items.find((i) => !i.isActive && !present.has(i.id));
+    if (retired) throw badRequest(`Amenity ${retired.name} is no longer offered`);
+    await tx.providerAmenity.deleteMany({ where: { providerId, amenityId: { notIn: items.map((i) => i.id) } } });
     const missing = items.filter((i) => !present.has(i.id));
     if (missing.length) await tx.providerAmenity.createMany({ data: missing.map((i) => ({ providerId, amenityId: i.id })) });
     await audit(tx, { action: 'provider.amenities_updated', entityType: 'provider', entityId: providerId, actorUserId: actor.userId, metadata: { codes: amenityCodes } });

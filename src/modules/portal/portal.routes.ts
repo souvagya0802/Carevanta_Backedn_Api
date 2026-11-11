@@ -1298,7 +1298,7 @@ export function portalRouter(): Router {
     summary: 'Facility amenities and capabilities',
     tags,
     response: z.array(z.object({ code: z.string(), name: z.string() })),
-    handler: async () => prisma.amenity.findMany({ select: { code: true, name: true }, orderBy: { name: 'asc' } }),
+    handler: async () => prisma.amenity.findMany({ where: { isActive: true }, select: { code: true, name: true }, orderBy: { name: 'asc' } }),
   });
 
   defineRoute(r, cat, {
