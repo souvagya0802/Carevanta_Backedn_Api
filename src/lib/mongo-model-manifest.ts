@@ -599,7 +599,8 @@ export const MODELS: Record<string, ModelMeta> = {
   },
   VerificationToken: {
     optionalScalars: [
-      "consumedAt"
+      "consumedAt",
+      "attempts"
     ],
     foreignKeys: [
       "userId"
