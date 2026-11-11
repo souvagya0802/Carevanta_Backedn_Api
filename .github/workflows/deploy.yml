@@ -1,12 +1,13 @@
-# Build, publish and deploy the Carevanta API (and the worker, which runs the same image) to staging.
+# Deploy the Carevanta API (and the worker, which runs the same image) to staging.
 #
 # Trigger: a push to the `staging` branch, or a manual run. Production (from `main`) is not wired yet.
 #
 #   checks  → the full CI workflow (typecheck, lint, unit + integration tests, build, container smoke test)
-#   image   → build once, push ghcr.io/souvagya0802/carevanta-api:staging and :staging-<short sha>
-#   deploy  → SSH to the VPS as the non-root `deploy` user and run /opt/carevanta/deploy.sh api <tag>
-#             (the script pulls the tag, recreates api + worker, and keeps the previous tag for rollback),
-#             then wait for https://staging-api.carevanta.tech/health/ready to return 200.
+#   deploy  → SSH to the VPS as the non-root `deploy` user and run /opt/carevanta/deploy.sh api.
+#             The image is built on the VPS: the script fetches `staging`, resets to origin/staging, records
+#             the previous commit for rollback, runs `docker compose build api`, recreates api + worker,
+#             waits for health and exits non-zero on failure. It holds a lock so two builds never overlap.
+#             Then the workflow checks https://staging-api.carevanta.tech/health/ready from the internet.
 #
 # Secrets live in the GitHub environment `staging`: VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_KNOWN_HOSTS.
 # VPS_KNOWN_HOSTS is the server's known_hosts line(s) (ssh-keyscan output checked by hand), so the host key is
@@ -28,7 +29,6 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/souvagya0802/carevanta-api
   HEALTH_URL: https://staging-api.carevanta.tech/health/ready
 
 jobs:
@@ -37,46 +37,12 @@ jobs:
     uses: ./.github/workflows/ci.yml
     secrets: inherit
 
-  image:
-    name: Build and push image
-    needs: checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: tag
-        name: Image tag
-        run: echo "tag=staging-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:staging
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   deploy:
     name: Deploy to staging
-    needs: image
+    needs: checks
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Building the image on the VPS takes a few minutes; the script's own health wait is included.
+    timeout-minutes: 25
     environment:
       name: staging
       url: https://staging-api.carevanta.tech
@@ -91,16 +57,15 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
-      - name: Run deploy.sh on the VPS
+      - name: Run deploy.sh on the VPS (build, recreate api + worker)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          TAG: ${{ needs.image.outputs.tag }}
         run: |
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 \
-            "$VPS_USER@$VPS_HOST" "/opt/carevanta/deploy.sh api '$TAG'"
+            -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
+            "$VPS_USER@$VPS_HOST" "/opt/carevanta/deploy.sh api"
       - name: Health gate (up to 2 minutes)
         run: |
           for i in $(seq 1 24); do
@@ -109,7 +74,7 @@ jobs:
             if [ "$code" = "200" ]; then exit 0; fi
             sleep 5
           done
-          echo "::error::$HEALTH_URL did not return 200 within 2 minutes. deploy.sh kept the previous tag on the VPS for rollback."
+          echo "::error::$HEALTH_URL did not return 200 within 2 minutes. deploy.sh recorded the previous commit on the VPS for rollback."
           exit 1
       - name: Remove the key
         if: always()
