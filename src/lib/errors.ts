@@ -7,6 +7,7 @@ export type ErrorCode =
   | 'ACCOUNT_LOCKED'
   | 'ACCOUNT_INACTIVE'
   | 'TOKEN_INVALID'
+  | 'TOO_MANY_ATTEMPTS'
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'CONFLICT'

@@ -229,9 +229,15 @@ export async function changePassword(userId: string, sessionId: string, currentP
 
 const TOKEN_TTL_MIN: Record<TokenPurpose, number> = {
   PASSWORD_RESET: 30,
-  EMAIL_VERIFICATION: 24 * 60,
+  // A 6-digit code has little entropy, so it lives briefly and allows few guesses.
+  EMAIL_VERIFICATION: 30,
   PHONE_VERIFICATION: 10,
 };
+
+/** Email and phone verification use a 6-digit code typed into the app; password reset keeps a long link token. */
+const OTP_PURPOSES: readonly TokenPurpose[] = ['EMAIL_VERIFICATION', 'PHONE_VERIFICATION'];
+/** Wrong codes allowed on one active code before it is invalidated and a new one must be requested. */
+export const MAX_OTP_ATTEMPTS = 5;
 
 async function createVerificationToken(tx: Tx, userId: string, purpose: TokenPurpose) {
   // Invalidate earlier unconsumed tokens of the same purpose.
@@ -239,9 +245,10 @@ async function createVerificationToken(tx: Tx, userId: string, purpose: TokenPur
     where: { userId, purpose, consumedAt: null },
     data: { consumedAt: new Date() },
   });
-  const raw = purpose === 'PHONE_VERIFICATION' ? String(randomInt(0, 1_000_000)).padStart(6, '0') : randomToken(32);
+  const otp = OTP_PURPOSES.includes(purpose);
+  const raw = otp ? String(randomInt(0, 1_000_000)).padStart(6, '0') : randomToken(32);
   // OTPs have low entropy, so bind the hash to the user to prevent cross-user lookup.
-  const tokenHash = sha256Hex(purpose === 'PHONE_VERIFICATION' ? `${userId}:${raw}` : raw);
+  const tokenHash = sha256Hex(otp ? `${userId}:${raw}` : raw);
   await tx.verificationToken.create({
     data: { userId, purpose, tokenHash, expiresAt: new Date(Date.now() + TOKEN_TTL_MIN[purpose] * 60_000) },
   });
@@ -355,9 +362,12 @@ export async function requestContactVerification(userId: string, channel: 'EMAIL
 }
 
 export async function confirmContactVerification(input: { token: string; userId?: string }) {
+  const isOtp = /^\d{6}$/.test(input.token);
+  if (isOtp && !input.userId) throw badRequest('Sign in to confirm a verification code');
+  // A wrong code is counted in its own transaction so the count survives the error response.
+  if (isOtp) await countOtpAttempt(input.userId!, input.token);
   return prisma.$transaction(async (tx) => {
-    const isOtp = /^\d{6}$/.test(input.token);
-    if (isOtp && !input.userId) throw badRequest('Sign in to confirm a mobile verification code');
+    // Older email links (long tokens issued before codes) keep working until they expire.
     const tokenHash = sha256Hex(isOtp ? `${input.userId}:${input.token}` : input.token);
     const record = await tx.verificationToken.findUnique({ where: { tokenHash } });
     if (
@@ -387,4 +397,33 @@ export async function confirmContactVerification(input: { token: string; userId?
     });
     return { status: updated.status };
   });
+}
+
+/**
+ * Brute-force guard for 6-digit codes. When the code matches one of the user's
+ * active codes, nothing is counted. Otherwise every active code of that user
+ * gets one more wrong attempt; at MAX_OTP_ATTEMPTS the codes are invalidated and
+ * the caller must request a new one. The error is thrown after the transaction
+ * commits, so the count is kept.
+ */
+async function countOtpAttempt(userId: string, code: string): Promise<void> {
+  const tooMany = await transactionWithRetry(async (tx) => {
+    const now = new Date();
+    const active = await tx.verificationToken.findMany({
+      where: { userId, purpose: { in: [...OTP_PURPOSES] }, consumedAt: null, expiresAt: { gt: now } },
+      select: { id: true, tokenHash: true, attempts: true },
+    });
+    if (active.length === 0) return false;
+    if (active.some((t) => t.tokenHash === sha256Hex(`${userId}:${code}`))) return false;
+    let locked = false;
+    for (const t of active) {
+      const attempts = (t.attempts ?? 0) + 1;
+      const lock = attempts >= MAX_OTP_ATTEMPTS;
+      locked ||= lock;
+      await tx.verificationToken.update({ where: { id: t.id }, data: { attempts, ...(lock ? { consumedAt: now } : {}) } });
+    }
+    if (locked) await audit(tx, { action: 'auth.verification_locked', entityType: 'user', entityId: userId, actorType: 'SYSTEM', metadata: { attempts: MAX_OTP_ATTEMPTS } });
+    return locked;
+  });
+  if (tooMany) throw new AppError(429, 'TOO_MANY_ATTEMPTS', 'Too many wrong codes. Send a new code and try again.');
 }

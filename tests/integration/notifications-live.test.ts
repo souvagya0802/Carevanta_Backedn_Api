@@ -61,6 +61,8 @@ describe('live notifications', () => {
   afterAll(async () => {
     await stopNotificationStreams();
     await closeMongoClient();
+    // A failed test can leave an SSE response open; drop it so close() cannot hang the hook.
+    server.closeAllConnections();
     await new Promise<void>((r) => server.close(() => r()));
   });
 

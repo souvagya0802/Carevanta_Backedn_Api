@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../src/lib/prisma.js';
 import { invalidateSetting } from '../../src/modules/settings/settings.service.js';
 import { resetDatabase } from '../helpers/db.js';
@@ -10,6 +10,14 @@ beforeAll(async () => {
   await resetDatabase();
   await prisma.platformSetting.update({ where: { key: 'finance.settlement_hold_days' }, data: { value: 0 } });
   await prisma.platformSetting.update({ where: { key: 'booking.require_provider_confirmation' }, data: { value: false } });
+  invalidateSetting();
+});
+
+// Test files share one database and run one after another: put the defaults back so later files
+// (bookings, reminders, notifications) still see bookings start as REQUESTED.
+afterAll(async () => {
+  await prisma.platformSetting.update({ where: { key: 'finance.settlement_hold_days' }, data: { value: 7 } });
+  await prisma.platformSetting.update({ where: { key: 'booking.require_provider_confirmation' }, data: { value: true } });
   invalidateSetting();
 });
 
