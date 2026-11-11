@@ -13,9 +13,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # deploy.yml runs these same checks before building and deploying an image.
+  workflow_call:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
