@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../src/lib/prisma.js';
 import { resetDatabase } from '../helpers/db.js';
-import { approveProvider, createHospital, staff } from '../helpers/fixtures.js';
+import { approveProvider, createDoctor, createHospital, staff } from '../helpers/fixtures.js';
 import { cleanupExpired, enforceCredentialExpiry, openRenewalReminders } from '../../src/jobs/maintenance.js';
 import { seedReferenceData } from '../../src/seed/reference-data.js';
 
@@ -28,6 +28,32 @@ describe('scheduled maintenance', () => {
     expect(await prisma.verificationCase.count({ where: { providerId: p.id, kind: 'RENEWAL' } })).toBe(1);
     // Idempotent: a second run changes nothing.
     expect((await enforceCredentialExpiry()).providersSuspended).toBe(0);
+  });
+
+  it('keeps doctors and pharmacies whose credentials have no expiry date, and suspends a doctor whose registration lapsed', async () => {
+    const { registrar, verifier } = await staff();
+    const ph = await registrar.post('/api/v1/admin/providers', {
+      type: 'PHARMACY',
+      legalName: 'Open-ended Pharmacy',
+      displayName: 'Open-ended Pharmacy',
+      contactPhone: '9800012346',
+      pharmacy: { retailDrugLicenseNo: 'WB-RDL-NOEXP', drugLicenseValidUntil: '2030-01-01' },
+      location: { name: 'Shop', addressLine1: 'Road', city: 'Tamluk', district: 'Purba Medinipur', state: 'West Bengal', pincode: '721636' },
+    });
+    await approveProvider(ph.body.data.id, registrar, verifier);
+    await prisma.pharmacyProfile.update({ where: { providerId: ph.body.data.id }, data: { drugLicenseValidUntil: null } });
+    const keep = await createDoctor(registrar);
+    const lapse = await createDoctor(registrar);
+    await approveProvider(keep.id, registrar, verifier);
+    await approveProvider(lapse.id, registrar, verifier);
+    await prisma.professionalRegistration.updateMany({ where: { doctorProviderId: keep.id }, data: { validUntil: null, verifiedAt: new Date() } });
+    await prisma.professionalRegistration.updateMany({ where: { doctorProviderId: lapse.id }, data: { validUntil: new Date('2020-01-01'), verifiedAt: new Date() } });
+
+    await enforceCredentialExpiry();
+    const status = async (id: string) => (await prisma.provider.findUniqueOrThrow({ where: { id } })).status;
+    expect(await status(ph.body.data.id)).toBe('APPROVED');
+    expect(await status(keep.id)).toBe('APPROVED');
+    expect(await status(lapse.id)).toBe('SUSPENDED');
   });
 
   it('opens renewal reminders 30 days ahead and cleans up expired rows', async () => {

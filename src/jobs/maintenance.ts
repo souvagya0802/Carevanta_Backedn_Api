@@ -19,8 +19,16 @@ export async function enforceCredentialExpiry(now = new Date()): Promise<{ docum
   }
 
   // Licences whose lapse makes the provider ineligible to operate.
-  const lapsedPharmacies = await prisma.provider.findMany({ where: { type: 'PHARMACY', status: 'APPROVED', pharmacyProfile: { drugLicenseValidUntil: { lt: now } } }, select: { id: true } });
-  const lapsedDoctors = await prisma.provider.findMany({ where: { type: 'DOCTOR', status: 'APPROVED', doctorProfile: { registrations: { every: { OR: [{ validUntil: { lt: now } }, { verifiedAt: null }] } } } }, select: { id: true } });
+  // Decided in code, not in a relation filter: on MongoDB, Prisma evaluates date comparisons inside relation
+  // filters as aggregation expressions, where a missing or null date sorts BEFORE every date. `validUntil < now`
+  // then matched credentials with no expiry at all and suspended every doctor and pharmacy on staging.
+  // A blank expiry date means the credential does not expire.
+  const lapsed = (d: Date | null | undefined) => d instanceof Date && d.getTime() < now.getTime();
+  const pharmacies = await prisma.provider.findMany({ where: { type: 'PHARMACY', status: 'APPROVED' }, select: { id: true, pharmacyProfile: { select: { drugLicenseValidUntil: true } } } });
+  const lapsedPharmacies = pharmacies.filter((p) => lapsed(p.pharmacyProfile?.drugLicenseValidUntil));
+  // A doctor needs at least one verified registration that has not lapsed.
+  const doctors = await prisma.provider.findMany({ where: { type: 'DOCTOR', status: 'APPROVED' }, select: { id: true, doctorProfile: { select: { registrations: { select: { validUntil: true, verifiedAt: true } } } } } });
+  const lapsedDoctors = doctors.filter((p) => !(p.doctorProfile?.registrations ?? []).some((r) => r.verifiedAt != null && !lapsed(r.validUntil)));
   const docExpired = new Set(expiredDocs.filter((d) => ['DRUG_LICENSE', 'MEDICAL_REGISTRATION_CERTIFICATE', 'CLINICAL_ESTABLISHMENT_REGISTRATION'].includes(d.documentType)).map((d) => d.providerId));
   const toSuspend = new Set([...lapsedPharmacies.map((p) => p.id), ...lapsedDoctors.map((p) => p.id), ...docExpired]);
   for (const providerId of toSuspend) {
