@@ -25,6 +25,7 @@
     "db:seed": "tsx prisma/seed.ts",
     "admin:bootstrap": "tsx scripts/bootstrap-super-admin.ts",
     "medicines:import": "tsx scripts/import-cdci.ts",
+    "medicines:backfill-info": "tsx scripts/backfill-medicine-info.ts",
     "demo:seed": "tsx scripts/demo-seed.ts",
     "demo:seed:more": "tsx scripts/demo-seed-more-types.ts",
     "demo:accounts": "tsx scripts/demo-accounts.ts",

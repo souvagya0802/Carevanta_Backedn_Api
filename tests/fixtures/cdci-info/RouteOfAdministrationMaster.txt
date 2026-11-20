@@ -1,0 +1,2 @@
+Identifier	RouteOfAdministration
+26643006	Oral route

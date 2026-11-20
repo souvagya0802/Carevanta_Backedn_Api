@@ -6,6 +6,7 @@ import type { Prisma } from '../../../generated/prisma/client.js';
 import { prisma } from '../../lib/prisma.js';
 import { ejsonDate } from '../../lib/mongo.js';
 import { normaliseSpace, parseBrandName, searchKey, splitTsv, titleCase } from './cdci-parse.js';
+import { cdciInfo, compositionKey, substituteKey, INFO_COLUMNS, INFO_FIELDS, type CdciGenericInfo, type CdciSubstanceInfo, type MedicineInfo } from './medicine-info.js';
 
 /**
  * Imports (or refreshes) the medicine catalogue from a Common Drug Codes for India (CDCI) flat-file
@@ -14,6 +15,10 @@ import { normaliseSpace, parseBrandName, searchKey, splitTsv, titleCase } from '
  * rather than the native driver because Node's own DNS cannot resolve the Atlas SRV record on some
  * Windows set-ups, while Prisma's engine can. Descriptive fields are refreshed on every run; schedule,
  * requiresPrescription and isActive are only set when a row is first inserted, so admin edits survive.
+ *
+ * Patient information (therapeutic class, uses, contraindications, interactions from GenericMaster; how it
+ * works and side effects from SubstanceMaster via the generic's substance ids) is filled with infoSource
+ * 'CDCI' in a second update per batch that never touches rows whose infoSource is 'ADMIN'.
  *
  * CDCI carries no drug-schedule data, so new rows are imported as prescription-only with the strictest
  * non-narcotic schedule (SCHEDULE_H1). Admins relax individual medicines afterwards.
@@ -30,6 +35,8 @@ export interface CdciImportResult {
   updated: number;
   unchanged: number;
   skipped: number;
+  /** Rows whose CDCI information was filled or changed. */
+  infoUpdated: number;
   ms: number;
 }
 
@@ -84,6 +91,7 @@ export async function importCdci(
   const suppliers = await lookup(join(dir, 'SupplierMaster.txt'), 'Identifier', 'Supplier Name');
   const routes = await lookup(join(dir, 'RouteOfAdministrationMaster.txt'), 'Identifier', 'RouteOfAdministration');
   const generics = new Map<string, { name: string; route: string | null }>();
+  const info = await loadCdciInfo(dir);
   if (existsSync(join(dir, 'GenericMaster.txt'))) {
     for await (const g of rows(join(dir, 'GenericMaster.txt'))) {
       const routeNames = (g['Route of Administration'] ?? '')
@@ -105,9 +113,11 @@ export async function importCdci(
     updated: 0,
     unchanged: 0,
     skipped: 0,
+    infoUpdated: 0,
     ms: 0,
   };
   let ops: Record<string, unknown>[] = [];
+  let infoOps: Record<string, unknown>[] = [];
   const flush = async () => {
     if (!ops.length) return;
     const res = (await db.$runCommandRaw({
@@ -126,6 +136,9 @@ export async function importCdci(
     result.updated += res.nModified ?? 0;
     result.unchanged += (res.n ?? 0) - inserted - (res.nModified ?? 0);
     ops = [];
+    // Information second, so a row inserted above is already there.
+    if (infoOps.length) result.infoUpdated += await runUpdates(db, infoOps);
+    infoOps = [];
     opts.log?.(`  ${result.read} rows read`);
   };
 
@@ -154,6 +167,7 @@ export async function importCdci(
           route: generic?.route ?? null,
           manufacturer,
           search_name: searchKey(p.name, p.composition),
+          composition_key: compositionKey(p.composition, p.strength, p.dosageForm),
           source: 'CDCI',
         },
         $setOnInsert: {
@@ -170,9 +184,125 @@ export async function importCdci(
       },
       upsert: true,
     });
+    const filled = info.get(b['Generic Identifier'] ?? '');
+    if (filled) infoOps.push(infoUpdate({ code }, filled, new Date()));
     if (ops.length >= BATCH) await flush();
   }
   await flush();
   result.ms = Date.now() - started;
   return result;
+}
+
+/** Runs an unordered raw `update` command (never inside a transaction) and returns how many rows changed. */
+async function runUpdates(db: Pick<typeof prisma, '$runCommandRaw'>, updates: Record<string, unknown>[]): Promise<number> {
+  const res = (await db.$runCommandRaw({ update: 'medicines', updates, ordered: false } as unknown as Prisma.InputJsonObject)) as unknown as { nModified?: number; writeErrors?: { errmsg?: string }[] };
+  if (res.writeErrors?.length) throw new Error(`Medicine information write error: ${res.writeErrors[0]?.errmsg ?? 'unknown'}`);
+  return res.nModified ?? 0;
+}
+
+/**
+ * Update that sets the CDCI information on rows matching `filter` unless an admin edited it (infoSource 'ADMIN').
+ * A pipeline update, so `info_updated_at` only moves when a value really changes and a re-run reports no change.
+ */
+function infoUpdate(filter: Record<string, unknown>, info: MedicineInfo, at: Date): Record<string, unknown> {
+  const values: Record<string, unknown> = { info_source: 'CDCI' };
+  for (const f of INFO_FIELDS) values[INFO_COLUMNS[f]] = info[f];
+  const changed = { $or: Object.entries(values).map(([k, v]) => ({ $ne: [{ $ifNull: [`$${k}`, null] }, { $literal: v }] })) };
+  const set: Record<string, unknown> = {
+    info_updated_at: { $cond: [changed, ejsonDate(at), { $ifNull: ['$info_updated_at', null] }] },
+    info_updated_by_id: { $cond: [changed, null, { $ifNull: ['$info_updated_by_id', null] }] },
+  };
+  for (const [k, v] of Object.entries(values)) set[k] = { $literal: v };
+  return { q: { ...filter, info_source: { $ne: 'ADMIN' } }, u: [{ $set: set }], multi: false };
+}
+
+/** CDCI information per generic identifier, from GenericMaster.txt and SubstanceMaster.txt in `dir` (empty when the files are missing). */
+export async function loadCdciInfo(dir: string): Promise<Map<string, MedicineInfo>> {
+  const out = new Map<string, MedicineInfo>();
+  const genericFile = join(dir, 'GenericMaster.txt');
+  if (!existsSync(genericFile)) return out;
+  const substances = new Map<string, CdciSubstanceInfo>();
+  const substanceFile = join(dir, 'SubstanceMaster.txt');
+  if (existsSync(substanceFile)) {
+    for await (const s of rows(substanceFile)) {
+      if (s.Identifier && s['Substance Name']) substances.set(s.Identifier, { name: normaliseSpace(s['Substance Name']), description: s['Substance Description'] ?? '', toxicity: s.Toxicity ?? '' });
+    }
+  }
+  for await (const g of rows(genericFile)) {
+    if (!g.Identifier) continue;
+    const generic: CdciGenericInfo = {
+      therapeuticRole: g['Therapeutic Role'] ?? '',
+      indication: g.Indication ?? '',
+      contraIndication: g['Contra Indication'] ?? '',
+      interaction: g['Interaction with Drugs'] ?? '',
+      substanceIds: (g['Substance Identifier'] ?? '').split('+').map((x) => x.trim()).filter(Boolean),
+    };
+    const filled = cdciInfo(generic, substances);
+    if (filled) out.set(g.Identifier, filled);
+  }
+  return out;
+}
+
+export interface BackfillResult { scanned: number; keysUpdated: number; infoUpdated: number; infoSkippedAdmin: number; ms: number }
+
+/**
+ * Backfill for existing rows: sets `compositionKey` on every medicine and fills the CDCI information of CDCI rows
+ * by generic code (never rows an admin edited). Reads the catalogue page by page, writes only rows whose value
+ * differs, in raw unordered batches outside any transaction, so it is idempotent and cheap to re-run.
+ */
+export async function backfillMedicineInfo(dir: string | null, opts: { log?: (msg: string) => void; page?: number } = {}): Promise<BackfillResult> {
+  const started = Date.now();
+  const info = dir ? await loadCdciInfo(dir) : new Map<string, MedicineInfo>();
+  const page = opts.page ?? 5000;
+  const result: BackfillResult = { scanned: 0, keysUpdated: 0, infoUpdated: 0, infoSkippedAdmin: 0, ms: 0 };
+  let cursor: string | undefined;
+  const now = new Date();
+  const genericByKey = new Map<string, string>();
+  const orphans: ({ key: string; id: string; infoSource: string | null } & Record<(typeof INFO_FIELDS)[number], string | null>)[] = [];
+  for (;;) {
+    const batch = await prisma.medicine.findMany({
+      where: cursor ? { id: { gt: cursor } } : {},
+      orderBy: { id: 'asc' },
+      take: page,
+      select: { id: true, composition: true, genericName: true, source: true, strength: true, dosageForm: true, compositionKey: true, genericCode: true, infoSource: true, therapeuticClass: true, uses: true, howItWorks: true, sideEffects: true, contraindications: true, interactions: true },
+    });
+    if (!batch.length) break;
+    cursor = batch[batch.length - 1]!.id;
+    result.scanned += batch.length;
+    const keyOps: Record<string, unknown>[] = [];
+    const infoOps: Record<string, unknown>[] = [];
+    for (const m of batch) {
+      const key = substituteKey(m);
+      if (key !== (m.compositionKey ?? null)) keyOps.push({ q: { _id: m.id }, u: { $set: { composition_key: key } }, multi: false });
+      if (!m.genericCode) { if (key) orphans.push({ ...m, key }); continue; }
+      const filled = info.get(m.genericCode);
+      if (!filled) continue;
+      if (key && !genericByKey.has(key)) genericByKey.set(key, m.genericCode);
+      queueInfo(m, filled, infoOps);
+    }
+    await write(keyOps, infoOps);
+    opts.log?.(`  ${result.scanned} scanned, ${result.keysUpdated} keys and ${result.infoUpdated} information rows written`);
+  }
+  // Medicines added by hand or by a pharmacy have no CDCI generic code: they take the CDCI text of a CDCI medicine with
+  // the same salt, strength and form (CDCI information is per generic, so that is the same text).
+  const borrowed: Record<string, unknown>[] = [];
+  for (const m of orphans) {
+    const code = genericByKey.get(m.key);
+    const filled = code ? info.get(code) : undefined;
+    if (filled) queueInfo(m, filled, borrowed);
+  }
+  await write([], borrowed);
+  result.ms = Date.now() - started;
+  return result;
+
+  type Row = { id: string; infoSource: string | null } & Record<(typeof INFO_FIELDS)[number], string | null>;
+  function queueInfo(m: Row, filled: MedicineInfo, into: Record<string, unknown>[]) {
+    if (m.infoSource === 'ADMIN') { result.infoSkippedAdmin++; return; }
+    if (m.infoSource === 'CDCI' && INFO_FIELDS.every((f) => (m[f] ?? null) === filled[f])) return;
+    into.push(infoUpdate({ _id: m.id }, filled, now));
+  }
+  async function write(keyOps: Record<string, unknown>[], infoOps: Record<string, unknown>[]) {
+    for (let i = 0; i < keyOps.length; i += BATCH) result.keysUpdated += await runUpdates(prisma, keyOps.slice(i, i + BATCH));
+    for (let i = 0; i < infoOps.length; i += BATCH) result.infoUpdated += await runUpdates(prisma, infoOps.slice(i, i + BATCH));
+  }
 }

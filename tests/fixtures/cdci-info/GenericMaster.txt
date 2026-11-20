@@ -1,0 +1,5 @@
+Identifier	Generic Name	Substance Identifier	Route of Administration	Dose Form	Therapeutic Role	Indication	Contra Indication	Interaction with Drugs	Classification of Drugs	Source/ Regulatory	last_updated_on
+6101	Paracetamol 650 mg oral tablet	1	26643006	2	Analgesic	Fever and mild to moderate pain.	Severe liver disease.	Warfarin: may raise INR with regular use.		CDSCO	20260101
+6102	Paracetamol 500 mg oral tablet	1	26643006	2	Analgesic	Fever and pain.					20260101
+6103	Paracetamol 25 mg/mL oral syrup	1	26643006	2							20260101
+6104	Caffeine 30 mg and paracetamol 500 mg oral tablet	3+1	26643006	2		Headache.					20260101

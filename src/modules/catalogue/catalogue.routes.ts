@@ -9,7 +9,9 @@ import { MoneyInput, SearchText } from '../../http/dto.js';
 import { listOfferings, upsertOffering } from '../providers/provider-admin.service.js';
 import { clearSearchVocabulary } from '../discovery/smart-search.js';
 import { searchKey } from './cdci-parse.js';
+import { bulkUpdateMedicines, BulkInput, substituteKey, findDuplicates, InfoInput, medicineDetail, medicineFilterWhere, medicineHistory, MedicineListFilters, medicineOverview, medicineStock, medicineSubstitutes, mergeMedicine, restoreGovernmentInfo, stockedCounts, updateMedicineInfo } from './medicines.service.js';
 import type { Medicine } from '../../../generated/prisma/client.js';
+import { medicineImageUrl } from './medicine-image-url.js';
 
 /** Everyday words patients type for a speciality or test. Lowercase, de-duplicated. */
 const Synonyms = z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).transform((xs) => [...new Set(xs)]);
@@ -604,8 +606,26 @@ export function catalogueRouter(): Router {
     requiresPrescription: z.boolean(),
     isActive: z.boolean(),
     createdAt: z.string(),
+    // Additive fields (2026-11-20): patient information and substitutes key. Older rows may lack them.
+    genericCode: z.string().nullable().optional(),
+    compositionKey: z.string().nullable().optional(),
+    therapeuticClass: z.string().nullable().optional(),
+    uses: z.string().nullable().optional(),
+    howItWorks: z.string().nullable().optional(),
+    sideEffects: z.string().nullable().optional(),
+    contraindications: z.string().nullable().optional(),
+    interactions: z.string().nullable().optional(),
+    precautions: z.string().nullable().optional(),
+    storage: z.string().nullable().optional(),
+    infoSource: z.string().nullable().optional(),
+    infoUpdatedAt: z.string().nullable().optional(),
+    imageUrl: z.string().nullable().optional(),
+    imageSource: z.string().nullable().optional(),
+    imageUpdatedAt: z.string().nullable().optional(),
+    /** List only: pharmacies holding sellable stock. */
+    stockedAt: z.number().int().optional(),
   });
-  const medicineDto = (m: Medicine) => ({ ...m, createdAt: m.createdAt.toISOString(), updatedAt: undefined });
+  const medicineDto = (m: Medicine) => ({ ...m, createdAt: m.createdAt.toISOString(), infoUpdatedAt: m.infoUpdatedAt?.toISOString() ?? null, imageUpdatedAt: m.imageUpdatedAt?.toISOString() ?? null, imageUrl: medicineImageUrl(m), imageKey: undefined, updatedAt: undefined });
   const ScheduleEnum = z.enum(['OTC', 'SCHEDULE_G', 'SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X', 'OTHER']);
   const RX_SCHEDULES = ['SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X'];
 
@@ -616,21 +636,153 @@ export function catalogueRouter(): Router {
     summary: 'Medicine catalogue',
     tags,
     permissions: ['catalogue.read'],
-    query: PaginationQuery.extend({ q: SearchText.optional(), source: z.enum(['CDCI', 'MANUAL', 'PROVIDER']).optional() }),
+    description: 'Filters: q matches brand, generic name or salt; prescription, visibility, hasInfo (patient information present), inStock (a pharmacy holds sellable stock) and addedSince. Each row carries stockedAt.',
+    query: PaginationQuery.extend({ q: SearchText.optional(), source: z.enum(['CDCI', 'MANUAL', 'PROVIDER']).optional() }).merge(MedicineListFilters),
     response: MedicineDto,
     handler: async ({ query }) => {
+      const filters = await medicineFilterWhere(query);
       const rows = await prisma.medicine.findMany({
         where: {
           ...(query.source ? { source: query.source } : {}),
-          ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { genericName: { contains: query.q, mode: 'insensitive' } }] } : {}),
+          ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { genericName: { contains: query.q, mode: 'insensitive' } }, { composition: { contains: query.q, mode: 'insensitive' } }] } : {}),
           ...cursorWhere(query.cursor),
+          ...(filters.length ? { AND: filters } : {}),
         },
         orderBy: cursorOrderBy(),
         take: query.limit + 1,
       });
       const { items, page } = buildPage(rows, query.limit, (m) => m.createdAt);
-      return { items: items.map(medicineDto), page };
+      const stocked = await stockedCounts(items.map((m) => m.id));
+      return { items: items.map((m) => ({ ...medicineDto(m), stockedAt: stocked.get(m.id) ?? 0 })), page };
     },
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/overview',
+    summary: 'Medicine catalogue overview counts',
+    description: 'Totals for the overview tiles: in catalogue, stocked by at least one pharmacy, added by pharmacies in the last 30 days, missing patient information, prescription required, hidden from patients.',
+    tags,
+    permissions: ['catalogue.read'],
+    response: z.object({ total: z.number().int(), stocked: z.number().int(), addedByPharmaciesLast30Days: z.number().int(), missingInfo: z.number().int(), prescriptionRequired: z.number().int(), hidden: z.number().int(), withoutPhoto: z.number().int(), addedSince: z.string() }),
+    handler: () => medicineOverview(),
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/duplicates',
+    summary: 'Possible duplicates of a medicine about to be added',
+    tags,
+    permissions: ['catalogue.read'],
+    query: z.object({ name: z.string().trim().min(2).max(200), strength: z.string().max(64).optional(), dosageForm: z.string().max(64).optional() }),
+    response: z.array(z.object({ id: z.uuid(), name: z.string(), strength: z.string().nullable(), dosageForm: z.string().nullable(), manufacturer: z.string().nullable(), composition: z.string().nullable(), isActive: z.boolean(), exact: z.boolean() })),
+    handler: ({ query }) => findDuplicates(query.name, query.strength, query.dosageForm),
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/:id/detail',
+    summary: 'One medicine with stock and order usage and who last edited its information',
+    tags,
+    permissions: ['catalogue.read'],
+    params: IdParams,
+    response: z.object({ medicine: MedicineDto, stockedAt: z.number().int(), infoUpdatedByName: z.string().nullable(), imageAddedByPharmacy: z.string().nullable(), hasGovernmentSource: z.boolean(), usage: z.object({ inventoryRows: z.number().int(), orderItems: z.number().int() }) }),
+    handler: async ({ params }) => {
+      const d = await medicineDetail(params.id);
+      return { ...d, medicine: medicineDto(d.medicine) };
+    },
+  });
+
+  defineRoute(r, base, {
+    method: 'put',
+    path: '/medicines/:id/info',
+    summary: 'Edit the information patients read about a medicine',
+    description: 'Sets infoSource to ADMIN with the editor and time, so government imports never overwrite it. Omitted fields are kept; an empty string clears a field.',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: IdParams,
+    body: InfoInput,
+    response: MedicineDto,
+    handler: async ({ params, body, auth }) => medicineDto(await updateMedicineInfo(params.id, auth.userId, body)),
+  });
+
+  defineRoute(r, base, {
+    method: 'post',
+    path: '/medicines/:id/info/restore',
+    status: 200,
+    summary: 'Use the government (CDCI) information again',
+    description: 'Copies the CDCI text from a medicine with the same CDCI generic when one has it (restored = now); otherwise clears the fields so the next medicine list update fills them (restored = next_update).',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: IdParams,
+    body: z.object({ reason: z.string().trim().max(500).optional() }),
+    response: z.object({ medicine: MedicineDto, restored: z.enum(['now', 'next_update']) }),
+    handler: async ({ params, body }) => {
+      const res = await restoreGovernmentInfo(params.id, body.reason);
+      return { ...res, medicine: medicineDto(res.medicine) };
+    },
+  });
+
+  defineRoute(r, base, {
+    method: 'post',
+    path: '/medicines/bulk',
+    status: 200,
+    summary: 'Hide, show or change the prescription rule for up to 200 medicines',
+    description: 'One audit entry per medicine. no_prescription moves Schedule H/H1 to OTC and skips Schedule X.',
+    tags,
+    permissions: ['catalogue.manage'],
+    body: BulkInput,
+    response: z.object({ updated: z.number().int(), skipped: z.array(z.object({ id: z.string(), reason: z.string() })) }),
+    handler: ({ body }) => bulkUpdateMedicines(body),
+  });
+
+  defineRoute(r, base, {
+    method: 'post',
+    path: '/medicines/:id/merge',
+    status: 200,
+    summary: 'Merge a duplicate medicine into the one to keep',
+    description: 'Refused (409) while any pharmacy stock row or order line refers to the duplicate. The duplicate is hidden, not deleted; both medicines get an audit entry.',
+    tags,
+    permissions: ['catalogue.manage'],
+    params: IdParams,
+    body: z.object({ keepId: z.uuid(), reason: z.string().trim().min(3).max(500) }),
+    response: MedicineDto,
+    handler: async ({ params, body }) => medicineDto(await mergeMedicine(params.id, body.keepId, body.reason)),
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/:id/stock',
+    summary: 'Pharmacies stocking a medicine',
+    tags,
+    permissions: ['catalogue.read'],
+    params: IdParams,
+    response: z.array(z.object({ providerId: z.string(), providerName: z.string(), locationId: z.string(), locationName: z.string(), city: z.string(), quantity: z.number().int(), reserved: z.number().int(), batches: z.number().int(), expiredBatches: z.number().int(), nearestExpiry: z.string().nullable(), minPriceMinor: z.number(), maxPriceMinor: z.number(), maxMrpMinor: z.number() })),
+    handler: ({ params }) => medicineStock(params.id),
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/:id/substitutes',
+    summary: 'Medicines with the same salt, strength and form',
+    description: 'Information only: the platform never substitutes automatically.',
+    tags,
+    permissions: ['catalogue.read'],
+    params: IdParams,
+    response: z.object({ compositionKey: z.string().nullable(), items: z.array(z.object({ id: z.string(), name: z.string(), strength: z.string().nullable(), dosageForm: z.string().nullable(), manufacturer: z.string().nullable(), isActive: z.boolean(), requiresPrescription: z.boolean(), source: z.string(), imageUrl: z.string().nullable(), stockedAt: z.number().int() })) }),
+    handler: ({ params }) => medicineSubstitutes(params.id),
+  });
+
+  defineRoute(r, base, {
+    method: 'get',
+    path: '/medicines/:id/history',
+    summary: 'Change history of a medicine',
+    tags,
+    permissions: ['catalogue.read'],
+    params: IdParams,
+    query: z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) }),
+    response: z.array(z.object({ id: z.string(), action: z.string(), occurredAt: z.string(), actorName: z.string(), metadata: z.record(z.string(), z.unknown()).nullable() })),
+    handler: ({ params, query }) => medicineHistory(params.id, query.limit),
   });
 
   defineRoute(r, base, {
@@ -657,7 +809,7 @@ export function catalogueRouter(): Router {
       return uniqueGuard(
         () =>
           prisma.$transaction(async (tx) => {
-            const m = await tx.medicine.create({ data: { ...body, requiresPrescription, source: 'MANUAL', searchName: searchKey(body.name, body.composition) } });
+            const m = await tx.medicine.create({ data: { ...body, requiresPrescription, source: 'MANUAL', searchName: searchKey(body.name, body.composition), compositionKey: substituteKey({ composition: body.composition ?? null, genericName: body.genericName ?? null, source: 'MANUAL', strength: body.strength ?? null, dosageForm: body.dosageForm ?? null }) } });
             await audit(tx, { action: 'catalogue.medicine_created', entityType: 'medicine', entityId: m.id, metadata: { schedule: m.schedule } });
             return medicineDto(m);
           }),
@@ -702,7 +854,9 @@ export function catalogueRouter(): Router {
             const requiresPrescription = (changes.requiresPrescription ?? before.requiresPrescription) || RX_SCHEDULES.includes(schedule);
             const name = changes.name ?? before.name;
             const composition = changes.composition === undefined ? before.composition : changes.composition;
-            const m = await tx.medicine.update({ where: { id: params.id }, data: { ...changes, requiresPrescription, searchName: searchKey(name, composition) } });
+            const strength = changes.strength === undefined ? before.strength : changes.strength;
+            const dosageForm = changes.dosageForm === undefined ? before.dosageForm : changes.dosageForm;
+            const m = await tx.medicine.update({ where: { id: params.id }, data: { ...changes, requiresPrescription, searchName: searchKey(name, composition), ...(['composition', 'genericName', 'strength', 'dosageForm'].some((k) => k in changes) ? { compositionKey: substituteKey({ composition, genericName: changes.genericName === undefined ? before.genericName : changes.genericName, source: before.source, strength, dosageForm }) } : {}) } });
             await audit(tx, { action: 'catalogue.medicine_updated', entityType: 'medicine', entityId: m.id, metadata: { reason, fields: Object.keys(changes), source: m.source } });
             return medicineDto(m);
           }),

@@ -8,7 +8,7 @@
 import express, { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { notifyUsersWithPermission } from '../notifications/events.js';
-import { defineRoute } from '../../http/route.js';
+import { defineRoute, IdParams } from '../../http/route.js';
 import { prisma } from '../../lib/prisma.js';
 import { aggregate, boundingBox, distanceKmExpr, ejsonDate, istDayStart, num } from '../../lib/mongo.js';
 import { audit, logSensitiveAccess } from '../../lib/audit.js';
@@ -25,6 +25,9 @@ import { createDiagnosticOrder, listDiagnosticOrders, loadDiagnosticOrder } from
 import { advancePharmacyOrder, createPharmacyOrder, listPharmacyOrders, loadPharmacyOrder } from '../pharmacy/pharmacy.routes.js';
 import { loadDispatch } from '../ambulance/ambulance.routes.js';
 import { PatientUiSchema, patientUi, patientUiAdminView, type HeroImage } from './patient-ui.js';
+import { CDCI_ATTRIBUTION } from '../catalogue/cdci-import.js';
+import { medicineImageUrl } from '../catalogue/medicine-image-url.js';
+import { infoSourceLine, keyParts, substituteKey, NOT_MEDICAL_ADVICE, SUBSTITUTE_NOTE } from '../catalogue/medicine-info.js';
 
 const Passthrough = z.object({}).passthrough();
 const PROVIDER_TYPES = ['DOCTOR', 'HOSPITAL', 'CLINIC', 'DIAGNOSTIC_LAB', 'IMAGING_CENTRE', 'PHARMACY', 'AMBULANCE_OPERATOR'] as const;
@@ -53,6 +56,67 @@ const stockHorizon = () => new Date(istDayStart().getTime() + 30 * 86_400_000);
 /** `$lookup` that attaches the row's provider only when it is approved and listed; follow with `liveOnly` to keep such rows. */
 const liveProviderLookup = (localField: string) => ({ $lookup: { from: 'providers', localField, foreignField: '_id', pipeline: [{ $match: { status: 'APPROVED', is_listed: true } }, { $project: { _id: 1 } }], as: 'live' } });
 const liveOnly = { $match: { live: { $ne: [] } } };
+
+// ── Medicine availability (search, shop list and detail count pharmacies the same way) ──
+/** A patient's point and search radius, when the app sent a location. */
+interface GeoPoint { lat: number; lng: number; radiusKm: number }
+async function geoPoint(q: { lat?: number; lng?: number; radiusKm?: number }): Promise<GeoPoint | null> {
+  if (q.lat == null || q.lng == null) return null;
+  return { lat: q.lat, lng: q.lng, radiusKm: q.radiusKm ?? (await getSetting<number>('search.default_radius_km', 15)) };
+}
+/** For inventory rows: `km` from the point to the stocking pharmacy's nearest active location (null when it has none with coordinates). */
+const nearestKmStages = (lat: number, lng: number) => [
+  { $lookup: { from: 'provider_locations', localField: 'provider_id', foreignField: 'provider_id', pipeline: [{ $match: { is_active: true, latitude: { $type: 'number' }, longitude: { $type: 'number' } } }, { $project: { km: distanceKmExpr(lat, lng) } }, { $sort: { km: 1 } }, { $limit: 1 }], as: 'nl' } },
+  { $addFields: { km: { $ifNull: [{ $arrayElemAt: ['$nl.km', 0] }, null] } } },
+];
+/**
+ * Stages for sellable inventory rows → per `groupBy`: distinct approved, listed pharmacies (`pharmacies`), the lowest price
+ * (`from_minor`) and, with a point, the same within the radius (`nearby`, `from_minor_nearby`) plus the nearest stocking
+ * pharmacy (`nearest_provider`, `nearest_km`). Within the radius means the pharmacy's nearest active location is, exactly as
+ * `/discovery/providers?medicineId=` decides, so a count is never shown that the shop list then fails to list.
+ */
+function stockStats(geo: GeoPoint | null, groupBy: unknown): Record<string, unknown>[] {
+  const near = { $and: [{ $ne: ['$km', null] }, { $lte: ['$km', geo?.radiusKm ?? 0] }] };
+  return [
+    liveProviderLookup('provider_id'),
+    liveOnly,
+    ...(geo ? [...nearestKmStages(geo.lat, geo.lng), { $addFields: { km_sort: { $ifNull: ['$km', 1e9] } } }, { $sort: { km_sort: 1 } }] : []),
+    { $group: {
+      _id: groupBy,
+      pharmacies: { $addToSet: '$provider_id' },
+      from_minor: { $min: '$selling_price_minor' },
+      ...(geo ? { nearby: { $addToSet: { $cond: [near, '$provider_id', null] } }, from_minor_nearby: { $min: { $cond: [near, '$selling_price_minor', null] } }, nearest_km: { $first: '$km' }, nearest_provider: { $first: '$provider_id' } } : {}),
+    } },
+    { $project: { pharmacies: { $size: '$pharmacies' }, from_minor: 1, ...(geo ? { nearby: { $size: { $setDifference: ['$nearby', [null]] } }, from_minor_nearby: 1, nearest_km: 1, nearest_provider: 1 } : {}) } },
+  ];
+}
+type StockRow = { _id: string | null; pharmacies?: number; from_minor?: bigint | number | null; nearby?: number; from_minor_nearby?: bigint | number | null; nearest_km?: number | null; nearest_provider?: string | null };
+const Availability = z.object({
+  pharmaciesTotal: z.number().int().describe('Approved, listed pharmacies with sellable stock anywhere'),
+  pharmaciesNearby: z.number().int().nullable().describe('Of those, within radiusKm of the point (null without a point)'),
+  fromMinor: z.number().int().nullable(),
+  fromMinorNearby: z.number().int().nullable(),
+  radiusKm: z.number().nullable(),
+  nearest: z.object({ pharmacyId: z.uuid(), pharmacyName: z.string(), distanceKm: z.number() }).nullable().describe('Nearest stocking pharmacy (with a point)'),
+});
+type AvailabilityDto = z.infer<typeof Availability>;
+function availabilityOf(row: StockRow | undefined, geo: GeoPoint | null, names: Map<string, string>): AvailabilityDto {
+  const nearestName = row?.nearest_provider ? names.get(row.nearest_provider) : undefined;
+  return {
+    pharmaciesTotal: num(row?.pharmacies ?? 0),
+    pharmaciesNearby: geo ? num(row?.nearby ?? 0) : null,
+    fromMinor: minor(big(row?.from_minor ?? null)),
+    fromMinorNearby: geo ? minor(big(row?.from_minor_nearby ?? null)) : null,
+    radiusKm: geo?.radiusKm ?? null,
+    nearest: geo && row?.nearest_provider && nearestName && row.nearest_km != null ? { pharmacyId: row.nearest_provider, pharmacyName: nearestName, distanceKm: round1(row.nearest_km)! } : null,
+  };
+}
+async function pharmacyNames(ids: (string | null | undefined)[]): Promise<Map<string, string>> {
+  const unique = [...new Set(ids.filter((x): x is string => !!x))];
+  if (!unique.length) return new Map();
+  const rows = await prisma.provider.findMany({ where: { id: { in: unique } }, select: { id: true, displayName: true } });
+  return new Map(rows.map((p) => [p.id, p.displayName]));
+}
 /** For a `services` pipeline: how many live providers offer the service and the lowest price (`providers`, `from_minor`). */
 const offeringStats = [
   { $lookup: { from: 'provider_services', localField: '_id', foreignField: 'service_id', pipeline: [{ $match: { is_active: true } }, liveProviderLookup('provider_id'), liveOnly, { $group: { _id: null, providers: { $addToSet: '$provider_id' }, from_minor: { $min: '$price_minor' } } }], as: 'offer' } },
@@ -257,27 +321,114 @@ export function patientRouter(): Router {
   defineRoute(r, '/public/catalogue', {
     method: 'get',
     path: '/medicines',
-    summary: 'Medicines, with how many pharmacies currently stock each (public)',
+    summary: 'Medicines, with how many pharmacies currently stock each, near a point and in total (public)',
+    description: 'With lat/lng, `pharmaciesNearby` counts stocking pharmacies within radiusKm (default: the search radius setting), exactly as the shop list does. `pharmacies` is kept for older apps and equals `pharmaciesTotal`.',
     tags: pub,
     auth: 'none',
-    query: z.object({ q: z.string().trim().min(2).max(100), limit: z.coerce.number().int().min(1).max(50).default(20) }),
-    response: z.array(z.object({ id: z.uuid(), name: z.string(), genericName: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), schedule: z.string(), pharmacies: z.number().int(), fromMinor: z.number().int().nullable() })),
+    query: z.object({ q: z.string().trim().min(2).max(100), limit: z.coerce.number().int().min(1).max(50).default(20), ...Geo }),
+    response: z.array(z.object({ id: z.uuid(), name: z.string(), genericName: z.string().nullable(), composition: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), schedule: z.string(), pharmacies: z.number().int().describe('Same as pharmaciesTotal (kept for compatibility)'), imageUrl: z.string().nullable(), substitutes: z.number().int().describe('Other active medicines with the same salt, strength and form (capped at 50)') }).extend(Availability.shape)),
     handler: async ({ query }) => {
-      type Row = { _id: string; name: string; generic_name?: string | null; strength?: string | null; dosage_form?: string | null; pack_size?: string | null; manufacturer?: string | null; requires_prescription: boolean; schedule: string; pharmacies: number; from_minor: bigint | number | null };
+      const geo = await geoPoint(query);
+      type Row = { _id: string; name: string; generic_name?: string | null; composition?: string | null; strength?: string | null; dosage_form?: string | null; pack_size?: string | null; manufacturer?: string | null; requires_prescription: boolean; schedule: string; image_sha256?: string | null; s?: StockRow | null; substitutes: number };
       const rows = await aggregate<Row>(prisma, 'medicines', [
         { $match: { is_active: true, $or: [{ name: contains(query.q) }, { generic_name: contains(query.q) }] } },
-        // Distinct approved, listed pharmacies with sellable stock, and the lowest selling price among them.
-        { $lookup: { from: 'pharmacy_inventory', localField: '_id', foreignField: 'medicine_id', pipeline: [{ $match: inStock(stockHorizon()) }, liveProviderLookup('provider_id'), liveOnly, { $group: { _id: null, pharmacies: { $addToSet: '$provider_id' }, from_minor: { $min: '$selling_price_minor' } } }], as: 'stock' } },
-        { $project: { name: 1, generic_name: 1, strength: 1, dosage_form: 1, pack_size: 1, manufacturer: 1, requires_prescription: 1, schedule: 1, pharmacies: { $size: { $ifNull: [{ $arrayElemAt: ['$stock.pharmacies', 0] }, []] } }, from_minor: { $ifNull: [{ $arrayElemAt: ['$stock.from_minor', 0] }, null] } } },
-        { $sort: { pharmacies: -1, name: 1 } },
+        { $lookup: { from: 'pharmacy_inventory', localField: '_id', foreignField: 'medicine_id', pipeline: [{ $match: inStock(stockHorizon()) }, ...stockStats(geo, null)], as: 'stock' } },
+        { $addFields: { s: { $arrayElemAt: ['$stock', 0] } } },
+        { $addFields: { n_total: { $ifNull: ['$s.pharmacies', 0] }, n_near: { $ifNull: ['$s.nearby', 0] } } },
+        { $sort: geo ? { n_near: -1, n_total: -1, name: 1 } : { n_total: -1, name: 1 } },
         { $limit: query.limit },
+        // Substitutes: other active medicines sharing the key (a missing key matches nothing).
+        { $addFields: { ck: { $ifNull: ['$composition_key', '~none~'] } } },
+        { $lookup: { from: 'medicines', localField: 'ck', foreignField: 'composition_key', pipeline: [{ $match: { is_active: true } }, { $limit: 51 }, { $project: { _id: 1 } }], as: 'subs' } },
+        { $project: { name: 1, generic_name: 1, composition: 1, strength: 1, dosage_form: 1, pack_size: 1, manufacturer: 1, requires_prescription: 1, schedule: 1, image_sha256: 1, s: 1, substitutes: { $max: [0, { $subtract: [{ $size: '$subs' }, 1] }] } } },
       ]);
-      return rows.map((x) => ({ id: x._id, name: x.name, genericName: x.generic_name ?? null, strength: x.strength ?? null, dosageForm: x.dosage_form ?? null, packSize: x.pack_size ?? null, manufacturer: x.manufacturer ?? null, requiresPrescription: x.requires_prescription, schedule: x.schedule, pharmacies: num(x.pharmacies), fromMinor: minor(big(x.from_minor)) }));
+      const names = geo ? await pharmacyNames(rows.map((x) => x.s?.nearest_provider)) : new Map<string, string>();
+      return rows.map((x) => {
+        const a = availabilityOf(x.s ?? undefined, geo, names);
+        return { id: x._id, name: x.name, genericName: x.generic_name ?? null, composition: x.composition ?? null, strength: x.strength ?? null, dosageForm: x.dosage_form ?? null, packSize: x.pack_size ?? null, manufacturer: x.manufacturer ?? null, requiresPrescription: x.requires_prescription, schedule: x.schedule, pharmacies: a.pharmaciesTotal, imageUrl: medicineImageUrl({ id: x._id, imageSha256: x.image_sha256 }), substitutes: num(x.substitutes), ...a };
+      });
+    },
+  });
+
+  const SubstituteDto = z.object({ id: z.uuid(), name: z.string(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), imageUrl: z.string().nullable(), savingsMinor: z.number().int().nullable().describe('How much less than this medicine at the lowest prices (null when not cheaper or unknown)'), savingsPercent: z.number().int().nullable() }).extend(Availability.shape);
+  const MedicineDetail = z.object({
+    id: z.uuid(), name: z.string(), genericName: z.string().nullable(), composition: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), route: z.string().nullable(),
+    schedule: z.string(), requiresPrescription: z.boolean(), source: z.string(), compositionKey: z.string().nullable(), imageUrl: z.string().nullable(),
+    therapeuticClass: z.string().nullable(), uses: z.string().nullable(), howItWorks: z.string().nullable(), sideEffects: z.string().nullable(), contraindications: z.string().nullable(), interactions: z.string().nullable(), precautions: z.string().nullable(), storage: z.string().nullable(),
+    infoSource: z.string().nullable(), infoUpdatedAt: z.string().nullable(), infoSourceLine: z.string().nullable().describe('"Information from CDCI, Government of India" or "Reviewed by Carevanta"'), disclaimer: z.string(), attribution: z.string().nullable(),
+    availability: Availability,
+    substitutes: z.array(SubstituteDto).describe('Same salt, same strength, same form; in stock nearby first, then cheapest; at most 20'), substitutesTotal: z.number().int(), substituteNote: z.string(),
+    similarGenerics: z.array(z.object({ compositionKey: z.string(), strength: z.string().nullable(), medicines: z.number().int(), exampleId: z.uuid(), exampleName: z.string(), imageUrl: z.string().nullable() })).describe('Other strengths of the same composition and form, at most 10'),
+  });
+
+  defineRoute(r, '/public/catalogue', {
+    method: 'get',
+    path: '/medicines/:id',
+    summary: 'One medicine: information, availability near a point, substitutes and other strengths (public)',
+    description: 'Substitutes are information only: the platform never substitutes; the pharmacist decides and an order keeps the medicine the patient chose.',
+    tags: pub,
+    auth: 'none',
+    params: IdParams,
+    query: z.object({ ...Geo }),
+    response: MedicineDetail,
+    handler: async ({ params, query }) => {
+      const m = await prisma.medicine.findFirst({ where: { id: params.id, isActive: true } });
+      if (!m) throw notFound('Medicine');
+      const geo = await geoPoint(query);
+      const key = m.compositionKey ?? substituteKey(m);
+      const parts = key ? keyParts(key) : null;
+      const [subsAll, strengths] = await Promise.all([
+        key ? prisma.medicine.findMany({ where: { compositionKey: key, isActive: true, id: { not: m.id } }, select: { id: true, name: true }, take: 3000 }) : Promise.resolve([]),
+        parts
+          ? aggregate<{ _id: string; strength?: string | null; medicines: number; example_id: string; example_name: string; example_image?: string | null }>(prisma, 'medicines', [
+            { $match: { is_active: true, composition_key: { $regex: `^${rx(parts.ingredients)}\\|[^|]*\\|${rx(parts.family)}$`, $ne: key } } },
+            { $sort: { name: 1 } },
+            { $group: { _id: '$composition_key', strength: { $first: '$strength' }, medicines: { $sum: 1 }, example_id: { $first: '$_id' }, example_name: { $first: '$name' }, example_image: { $first: '$image_sha256' } } },
+            { $limit: 200 },
+          ])
+          : Promise.resolve([]),
+      ]);
+      const stats = await aggregate<StockRow>(prisma, 'pharmacy_inventory', [{ $match: { medicine_id: { $in: [m.id, ...subsAll.map((x) => x.id)] }, ...inStock(stockHorizon()) } }, ...stockStats(geo, '$medicine_id')]);
+      const statBy = new Map(stats.map((x) => [x._id!, x]));
+      const priceOf = (id: string) => { const x = statBy.get(id); return num(geo && x?.nearby ? x.from_minor_nearby : x?.from_minor) || null; };
+      const nearbyOf = (id: string) => num(statBy.get(id)?.nearby ?? 0);
+      const totalOf = (id: string) => num(statBy.get(id)?.pharmacies ?? 0);
+      const ranked = [...subsAll].sort((a, b) =>
+        (nearbyOf(b.id) > 0 ? 1 : 0) - (nearbyOf(a.id) > 0 ? 1 : 0)
+        || (totalOf(b.id) > 0 ? 1 : 0) - (totalOf(a.id) > 0 ? 1 : 0)
+        || (priceOf(a.id) ?? Number.MAX_SAFE_INTEGER) - (priceOf(b.id) ?? Number.MAX_SAFE_INTEGER)
+        || a.name.localeCompare(b.name)).slice(0, 20);
+      const [details, names] = await Promise.all([
+        prisma.medicine.findMany({ where: { id: { in: ranked.map((x) => x.id) } }, select: { id: true, name: true, strength: true, dosageForm: true, packSize: true, manufacturer: true, requiresPrescription: true, imageSha256: true } }),
+        pharmacyNames([m.id, ...ranked.map((x) => x.id)].map((id) => statBy.get(id)?.nearest_provider)),
+      ]);
+      const detailBy = new Map(details.map((d) => [d.id, d]));
+      const basePrice = priceOf(m.id);
+      const leading = (s: string | null | undefined) => { const n = parseFloat((s ?? '').replace(/[^\d.]+/u, ' ').trim()); return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER; };
+      return {
+        id: m.id, name: m.name, genericName: m.genericName, composition: m.composition, strength: m.strength, dosageForm: m.dosageForm, packSize: m.packSize, manufacturer: m.manufacturer, route: m.route,
+        schedule: m.schedule, requiresPrescription: m.requiresPrescription, source: m.source, compositionKey: key, imageUrl: medicineImageUrl(m),
+        therapeuticClass: m.therapeuticClass, uses: m.uses, howItWorks: m.howItWorks, sideEffects: m.sideEffects, contraindications: m.contraindications, interactions: m.interactions, precautions: m.precautions, storage: m.storage,
+        infoSource: m.infoSource, infoUpdatedAt: iso(m.infoUpdatedAt), infoSourceLine: infoSourceLine(m.infoSource), disclaimer: NOT_MEDICAL_ADVICE, attribution: m.source === 'CDCI' ? CDCI_ATTRIBUTION : null,
+        availability: availabilityOf(statBy.get(m.id), geo, names),
+        substitutes: ranked.map((x) => {
+          const d = detailBy.get(x.id)!;
+          const price = priceOf(x.id);
+          const save = basePrice != null && price != null && price < basePrice ? basePrice - price : null;
+          return { id: d.id, name: d.name, strength: d.strength, dosageForm: d.dosageForm, packSize: d.packSize, manufacturer: d.manufacturer, requiresPrescription: d.requiresPrescription, imageUrl: medicineImageUrl(d), savingsMinor: save, savingsPercent: save != null ? Math.round((save * 100) / basePrice!) : null, ...availabilityOf(statBy.get(x.id), geo, names) };
+        }),
+        substitutesTotal: subsAll.length,
+        substituteNote: SUBSTITUTE_NOTE,
+        similarGenerics: strengths
+          .sort((a, b) => leading(a.strength) - leading(b.strength) || (a.strength ?? '').localeCompare(b.strength ?? ''))
+          .slice(0, 10)
+          .map((x) => ({ compositionKey: x._id, strength: x.strength ?? null, medicines: num(x.medicines), exampleId: x.example_id, exampleName: x.example_name, imageUrl: medicineImageUrl({ id: x.example_id, imageSha256: x.example_image }) })),
+      };
     },
   });
 
   // ── Browsing providers ─────────────────────────────────────────────────
-  const Card = z.object({ id: z.uuid(), type: z.string(), name: z.string(), specialities: z.array(z.string()), yearsOfExperience: z.number().int().nullable(), feeMinor: z.number().int().nullable(), latitude: z.number().nullable(), longitude: z.number().nullable(), rating: z.number().nullable(), ratingCount: z.number().int(), locationName: z.string().nullable(), locality: z.string().nullable(), city: z.string().nullable(), distanceKm: z.number().nullable(), nextSlotAt: z.string().nullable(), homeService: z.boolean(), priceMinor: z.number().int().nullable() });
+  const Card = z.object({ id: z.uuid(), type: z.string(), name: z.string(), specialities: z.array(z.string()), yearsOfExperience: z.number().int().nullable(), feeMinor: z.number().int().nullable(), latitude: z.number().nullable(), longitude: z.number().nullable(), rating: z.number().nullable(), ratingCount: z.number().int(), locationName: z.string().nullable(), locality: z.string().nullable(), city: z.string().nullable(), distanceKm: z.number().nullable(), nextSlotAt: z.string().nullable(), homeService: z.boolean(), priceMinor: z.number().int().nullable(), beyondRadius: z.boolean().optional().describe('Medicine search only: true when no stocking pharmacy is within the radius and this is one of the nearest beyond it') });
 
   defineRoute(r, '/discovery', {
     method: 'get',
@@ -287,7 +438,7 @@ export function patientRouter(): Router {
     tags: pub,
     auth: 'none',
     query: z.object({ type: z.enum(PROVIDER_TYPES).optional(), q: z.string().trim().max(100).optional(), speciality: z.string().max(400).optional().describe('One speciality code, or several separated by commas'), serviceCode: z.string().max(64).optional(), medicineId: z.uuid().optional(), city: z.string().trim().max(120).optional(), sort: z.enum(['distance', 'rating', 'fee']).optional(), limit: z.coerce.number().int().min(1).max(60).default(24), ...Geo }),
-    response: z.object({ items: z.array(Card), radiusKm: z.number().nullable() }),
+    response: z.object({ items: z.array(Card), radiusKm: z.number().nullable(), beyondRadius: z.boolean().optional() }),
     handler: async ({ query }) => {
       const hasGeo = query.lat != null && query.lng != null;
       const radiusKm = query.radiusKm ?? (await getSetting<number>('search.default_radius_km', 15));
@@ -336,7 +487,8 @@ export function patientRouter(): Router {
       // Where the provider can be visited: its own active locations plus, for a doctor, each approved facility it is
       // actively affiliated with (restricted to the affiliation's location when one is set). One row per
       // (provider, affiliation, location), then the nearest location per provider wins (SQL `DISTINCT ON`).
-      pipeline.push(
+      // `restrict` keeps only locations within the radius; the medicine fallback below drops it to find the nearest beyond.
+      const tail = (restrict: boolean, limit: number, sort = query.sort): Record<string, unknown>[] => [
         { $lookup: { from: 'doctor_profiles', localField: '_id', foreignField: '_id', as: 'dp' } },
         { $lookup: { from: 'doctor_affiliations', localField: '_id', foreignField: 'doctor_provider_id', pipeline: [
           { $match: { status: 'ACTIVE' } },
@@ -347,7 +499,7 @@ export function patientRouter(): Router {
         { $lookup: { from: 'provider_locations', let: { pid: '$_id', fid: { $ifNull: ['$aff.facility_provider_id', null] }, fok: { $ifNull: ['$aff.facility_ok', false] }, aloc: { $ifNull: ['$aff.location_id', null] } }, pipeline: [
           { $match: {
             is_active: true,
-            ...(hasGeo ? boundingBox(query.lat!, query.lng!, radiusKm) : {}),
+            ...(hasGeo && restrict ? boundingBox(query.lat!, query.lng!, radiusKm) : {}),
             ...(query.city ? { city: equalsCi(query.city) } : {}),
             $expr: { $or: [{ $eq: ['$provider_id', '$$pid'] }, { $and: [{ $eq: ['$$fok', true] }, { $eq: ['$provider_id', '$$fid'] }, { $or: [{ $eq: ['$$aloc', null] }, { $eq: ['$$aloc', '$_id'] }] }] }] },
           } },
@@ -362,15 +514,22 @@ export function patientRouter(): Router {
         { $sort: { _id: 1, distance_km: 1 } },
         { $group: { _id: '$_id', doc: { $first: '$$ROOT' } } },
         { $replaceRoot: { newRoot: '$doc' } },
-        ...(hasGeo ? [{ $match: { distance_km: { $lte: radiusKm } } }] : []),
+        ...(hasGeo && restrict ? [{ $match: { distance_km: { $lte: radiusKm } } }] : []),
         // Postgres `NULLS LAST` on an ascending fee: MongoDB sorts nulls first, so sort on a "missing" flag before the value.
         { $addFields: { fee_missing: { $cond: [{ $eq: [{ $ifNull: ['$fee', null] }, null] }, 1, 0] } } },
-        { $sort: query.sort === 'rating' || (!hasGeo && query.sort !== 'fee') ? { rating_average: -1, rating_count: -1, distance_km: 1, display_name: 1 } : query.sort === 'fee' ? { fee_missing: 1, fee: 1, distance_km: 1, display_name: 1 } : { distance_km: 1, display_name: 1 } },
-        { $limit: query.limit },
+        { $sort: sort === 'rating' || (!hasGeo && sort !== 'fee') ? { rating_average: -1, rating_count: -1, distance_km: 1, display_name: 1 } : sort === 'fee' ? { fee_missing: 1, fee: 1, distance_km: 1, display_name: 1 } : { distance_km: 1, display_name: 1 } },
+        { $limit: limit },
         { $project: { type: 1, display_name: 1, years: 1, fee: 1, rating_average: 1, rating_count: 1, loc: 1, distance_km: 1, price_minor: 1, home_service: 1 } },
-      );
+      ];
       type Row = { _id: string; type: string; display_name: string; years?: number | null; fee?: bigint | number | null; rating_average?: number | null; rating_count: number; loc: { name: string; latitude?: number | null; longitude?: number | null; locality?: string | null; city?: string | null }; distance_km?: number | null; price_minor?: bigint | number | null; home_service?: boolean | null };
-      const rows = await aggregate<Row>(prisma, 'providers', pipeline);
+      let rows = await aggregate<Row>(prisma, 'providers', [...pipeline, ...tail(true, query.limit)]);
+      // A medicine nobody stocks within the radius: list the nearest stocking pharmacies beyond it (flagged), never an empty
+      // list while the medicine search says pharmacies have it.
+      let beyondRadius = false;
+      if (!rows.length && query.medicineId && hasGeo) {
+        rows = await aggregate<Row>(prisma, 'providers', [...pipeline, ...tail(false, Math.min(10, query.limit), 'distance')]);
+        beyondRadius = rows.length > 0;
+      }
       const ids = rows.map((x) => x._id);
       const [specs, nextSlots] = await Promise.all([
         prisma.doctorSpeciality.findMany({ where: { doctorProviderId: { in: ids }, verified: true }, orderBy: { isPrimary: 'desc' }, select: { doctorProviderId: true, speciality: { select: { name: true } } } }),
@@ -387,7 +546,8 @@ export function patientRouter(): Router {
       const nextBy = new Map(nextSlots.map((n) => [n._id, n.next]));
       return {
         radiusKm: hasGeo ? radiusKm : null,
-        items: rows.map((x) => ({ id: x._id, type: x.type, name: x.display_name, specialities: specBy.get(x._id) ?? [], yearsOfExperience: x.years ?? null, feeMinor: minor(big(x.fee)), latitude: x.loc?.latitude ?? null, longitude: x.loc?.longitude ?? null, rating: x.rating_average ?? null, ratingCount: num(x.rating_count), locationName: x.loc.name ?? null, locality: x.loc.locality ?? null, city: x.loc.city ?? null, distanceKm: round1(x.distance_km ?? null), nextSlotAt: iso(nextBy.get(x._id) ?? null), homeService: !!x.home_service, priceMinor: minor(big(x.price_minor)) })),
+        ...(query.medicineId ? { beyondRadius } : {}),
+        items: rows.map((x) => ({ ...(query.medicineId ? { beyondRadius } : {}), id: x._id, type: x.type, name: x.display_name, specialities: specBy.get(x._id) ?? [], yearsOfExperience: x.years ?? null, feeMinor: minor(big(x.fee)), latitude: x.loc?.latitude ?? null, longitude: x.loc?.longitude ?? null, rating: x.rating_average ?? null, ratingCount: num(x.rating_count), locationName: x.loc.name ?? null, locality: x.loc.locality ?? null, city: x.loc.city ?? null, distanceKm: round1(x.distance_km ?? null), nextSlotAt: iso(nextBy.get(x._id) ?? null), homeService: !!x.home_service, priceMinor: minor(big(x.price_minor)) })),
       };
     },
   });

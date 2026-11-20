@@ -22,6 +22,7 @@ import { portalRouter } from './modules/portal/portal.routes.js';
 import { patientRouter } from './modules/patient/patient.routes.js';
 import { reviewsRouter } from './modules/reviews/reviews.routes.js';
 import { cdciSyncRouter } from './modules/catalogue/cdci-sync.routes.js';
+import { medicineImagesRouter } from './modules/catalogue/medicine-images.routes.js';
 
 /** Mounts every module router under /api/v1. */
 export function apiRouter(): Router {
@@ -34,6 +35,7 @@ export function apiRouter(): Router {
   r.use(verificationRouter());
   r.use(catalogueRouter());
   r.use(cdciSyncRouter());
+  r.use(medicineImagesRouter());
   r.use(discoveryRouter());
   r.use(affiliationsRouter());
   r.use(appointmentsRouter());

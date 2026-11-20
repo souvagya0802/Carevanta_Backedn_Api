@@ -296,7 +296,29 @@ export const MODELS: Record<string, ModelMeta> = {
       "route",
       "proposedByProviderId",
       "proposedByUserId",
-      "searchName"
+      "searchName",
+      "compositionKey",
+      "therapeuticClass",
+      "uses",
+      "howItWorks",
+      "sideEffects",
+      "contraindications",
+      "interactions",
+      "precautions",
+      "storage",
+      "infoSource",
+      "infoUpdatedAt",
+      "infoUpdatedById",
+      "imageKey",
+      "imageMimeType",
+      "imageSha256",
+      "imageSource",
+      "imageCredit",
+      "imageLicence",
+      "imageSourceUrl",
+      "imageUpdatedAt",
+      "imageUpdatedById",
+      "imageUpdatedByProviderId"
     ],
     foreignKeys: [],
     relations: {
@@ -496,6 +518,21 @@ export const MODELS: Record<string, ModelMeta> = {
       "responseStatus",
       "lockedUntil"
     ],
+    foreignKeys: [],
+    relations: {}
+  },
+  Invoice: {
+    optionalScalars: [
+      "transactionId",
+      "settlementBatchId",
+      "patientProfileId",
+      "supersedesInvoiceId"
+    ],
+    foreignKeys: [],
+    relations: {}
+  },
+  InvoiceCounter: {
+    optionalScalars: [],
     foreignKeys: [],
     relations: {}
   },

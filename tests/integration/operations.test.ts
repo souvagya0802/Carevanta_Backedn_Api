@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../src/lib/prisma.js';
 import { invalidateSetting } from '../../src/modules/settings/settings.service.js';
 import { resetDatabase } from '../helpers/db.js';
@@ -6,6 +6,11 @@ import { actor, idem } from '../helpers/factory.js';
 import { actorForUser, approveProvider, patient, staff } from '../helpers/fixtures.js';
 
 beforeAll(resetDatabase);
+// This file edits search.default_radius_km through the admin API; platform settings survive resetDatabase, so put the default back for later files.
+afterAll(async () => {
+  await prisma.platformSetting.update({ where: { key: 'search.default_radius_km' }, data: { value: 15 } });
+  invalidateSetting();
+});
 
 const PDF = Buffer.from('%PDF-1.4\n% synthetic report\n%%EOF');
 

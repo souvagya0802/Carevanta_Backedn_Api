@@ -13,6 +13,7 @@ import { DateString, MoneyInput, Pincode, isoDate, minor } from '../../http/dto.
 import { assertProviderAccess } from '../providers/provider-access.js';
 import { createTransaction, onServiceCompleted, onSourceCancelled } from '../finance/commission.service.js';
 import type { PharmacyOrderStatus, Prisma } from '../../../generated/prisma/client.js';
+import { medicineImageUrl } from '../catalogue/medicine-image-url.js';
 
 export const PHARMACY_TRANSITIONS: TransitionMap<PharmacyOrderStatus> = {
   PLACED: ['PRESCRIPTION_REVIEW', 'ACCEPTED', 'REJECTED', 'CANCELLED'],
@@ -33,7 +34,7 @@ const Passthrough = z.object({ id: z.uuid() }).passthrough();
 const include = {
   provider: { select: { id: true, displayName: true } },
   patient: { select: { id: true, fullName: true } },
-  items: { include: { medicine: { select: { name: true, strength: true, schedule: true } }, inventory: { select: { batchNumber: true, expiryDate: true } } } },
+  items: { include: { medicine: { select: { id: true, name: true, strength: true, schedule: true, imageSha256: true } }, inventory: { select: { batchNumber: true, expiryDate: true } } } },
   transaction: { select: { id: true, status: true } },
 } satisfies Prisma.PharmacyOrderInclude;
 
@@ -52,7 +53,7 @@ function orderDto(o: Prisma.PharmacyOrderGetPayload<{ include: typeof include }>
     statusReason: o.statusReason,
     items: o.items.map((i) => ({
       id: i.id,
-      medicine: i.medicine,
+      medicine: { id: i.medicine.id, name: i.medicine.name, strength: i.medicine.strength, schedule: i.medicine.schedule, imageUrl: medicineImageUrl(i.medicine) },
       batchNumber: i.inventory?.batchNumber ?? null,
       expiryDate: isoDate(i.inventory?.expiryDate),
       quantity: i.quantity,

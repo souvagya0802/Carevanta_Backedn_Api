@@ -259,6 +259,49 @@ model Medicine {
   proposedByUserId     String?          @map("proposed_by_user_id")
   /// Lower-case name + composition, used for prefix search.
   searchName           String?          @map("search_name")
+  /// Normalised "same salt, same strength, same form" key (lower-case ingredients sorted, strength, dosage form).
+  /// Medicines sharing a key are substitutes of each other. Recomputed whenever composition, strength or form changes.
+  compositionKey       String?          @map("composition_key")
+
+  // ── Patient-facing information. Filled from CDCI where available (GenericMaster / SubstanceMaster), editable by admins.
+  /// Drug class, e.g. "Analgesic", "Antihistamine" (CDCI "Therapeutic Role").
+  therapeuticClass     String?          @map("therapeutic_class")
+  /// What it is used for (CDCI "Indication").
+  uses                 String?
+  /// How it works (CDCI substance description).
+  howItWorks           String?          @map("how_it_works")
+  /// Common side effects (CDCI substance toxicity / adverse reactions, or admin text).
+  sideEffects          String?          @map("side_effects")
+  /// When not to use it (CDCI "Contra Indication").
+  contraindications    String?
+  /// Medicines or foods it interacts with (CDCI "Interaction with Drugs").
+  interactions         String?
+  /// Safety advice: pregnancy, alcohol, driving, kidney or liver conditions (admin text).
+  precautions          String?
+  /// How to store it (admin text).
+  storage              String?
+  /// CDCI | ADMIN. ADMIN means an admin edited the information, so imports never overwrite it.
+  infoSource           String?          @map("info_source")
+  infoUpdatedAt        DateTime?        @map("info_updated_at")
+  infoUpdatedById      String?          @map("info_updated_by_id")
+
+  // ── Product photo (pack or strip). Stored with src/lib/storage.ts; served publicly by the API.
+  imageKey             String?          @map("image_key")
+  imageMimeType        String?          @map("image_mime_type")
+  /// Content hash; also the cache-busting version in the public image URL.
+  imageSha256          String?          @map("image_sha256")
+  /// ADMIN | PROVIDER | WEB. A pharmacy may add a photo when none exists or replace its own or a WEB one; only admins replace an ADMIN photo.
+  imageSource          String?          @map("image_source")
+  /// For WEB photos (openly licensed, chosen by an admin): credit line, licence and the source page, shown wherever the photo is shown.
+  imageCredit          String?          @map("image_credit")
+  imageLicence         String?          @map("image_licence")
+  imageSourceUrl       String?          @map("image_source_url")
+  /// True when the photo shows the salt/generic, not this brand's pack ("Representative image").
+  imageIsRepresentative Boolean         @default(false) @map("image_is_representative")
+  imageUpdatedAt       DateTime?        @map("image_updated_at")
+  imageUpdatedById     String?          @map("image_updated_by_id")
+  imageUpdatedByProviderId String?      @map("image_updated_by_provider_id")
+
   createdAt            DateTime         @default(now()) @map("created_at")
   updatedAt            DateTime         @updatedAt @map("updated_at")
 
@@ -270,5 +313,6 @@ model Medicine {
   @@index([genericName])
   @@index([searchName])
   @@index([source])
+  @@index([compositionKey])
   @@map("medicines")
 }

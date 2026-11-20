@@ -461,6 +461,13 @@ export const SCHEMA_INDEXES: IndexSpec[] = [
     }
   },
   {
+    collection: "medicines",
+    name: "medicines_composition_key_idx",
+    key: {
+      composition_key: 1
+    }
+  },
+  {
     collection: "service_transactions",
     name: "service_transactions_reference_key",
     key: {
@@ -821,6 +828,55 @@ export const SCHEMA_INDEXES: IndexSpec[] = [
     name: "idempotency_records_expires_at_idx",
     key: {
       expires_at: 1
+    }
+  },
+  {
+    collection: "invoices",
+    name: "invoices_number_key",
+    key: {
+      number: 1
+    },
+    unique: true
+  },
+  {
+    collection: "invoices",
+    name: "invoices_transaction_id_kind_idx",
+    key: {
+      transaction_id: 1,
+      kind: 1
+    }
+  },
+  {
+    collection: "invoices",
+    name: "invoices_settlement_batch_id_kind_idx",
+    key: {
+      settlement_batch_id: 1,
+      kind: 1
+    }
+  },
+  {
+    collection: "invoices",
+    name: "invoices_provider_id_issued_at_idx",
+    key: {
+      provider_id: 1,
+      issued_at: 1
+    }
+  },
+  {
+    collection: "invoices",
+    name: "invoices_patient_profile_id_issued_at_idx",
+    key: {
+      patient_profile_id: 1,
+      issued_at: 1
+    }
+  },
+  {
+    collection: "invoices",
+    name: "invoices_fiscal_year_kind_sequence_idx",
+    key: {
+      fiscal_year: 1,
+      kind: 1,
+      sequence: 1
     }
   },
   {

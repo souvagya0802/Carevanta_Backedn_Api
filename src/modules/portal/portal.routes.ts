@@ -18,6 +18,8 @@ import { DEFAULT_WORDS, PORTAL_PAGES, PORTAL_TYPES, memberCapabilityMatrix, port
 import { getSetting } from '../settings/settings.service.js';
 import { AddMedicineInput, addProviderMedicine, searchMedicines } from '../catalogue/medicines.service.js';
 import { medicineAddLimiter } from '../../middleware/rate-limit.js';
+import { medicineImageUrl } from '../catalogue/medicine-image-url.js';
+import { photoOwner } from '../catalogue/medicine-images.routes.js';
 import { getPushConfig, subscribe as pushSubscribe, unsubscribe as pushUnsubscribe } from '../notifications/push.service.js';
 import { LocationInput, UpdateProviderInput } from '../providers/providers.schemas.js';
 import * as providers from '../providers/providers.service.js';
@@ -622,7 +624,13 @@ export function portalRouter(): Router {
     response: z.array(Passthrough),
     handler: async ({ params, query, auth }) => {
       await assertProviderAccess(auth, params.providerId, { platformPermission: 'pharmacy.read', capability: 'manage_inventory' });
-      return listInventory(params.providerId, query);
+      const rows = await listInventory(params.providerId, query);
+      // Additive: each row's medicine carries its photo URL and who may change it (see medicine-images.routes.ts).
+      const photos = new Map((await prisma.medicine.findMany({ where: { id: { in: [...new Set(rows.map((x) => x.medicine.id))] } }, select: { id: true, dosageForm: true, imageSha256: true, imageSource: true, imageUpdatedByProviderId: true } })).map((m) => [m.id, m]));
+      return rows.map((x) => {
+        const p = photos.get(x.medicine.id);
+        return { ...x, medicine: { ...x.medicine, dosageForm: p?.dosageForm ?? null, imageUrl: p ? medicineImageUrl(p) : null, photoOwner: p ? photoOwner(p, params.providerId) : 'none' } };
+      });
     },
   });
 

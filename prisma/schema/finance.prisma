@@ -447,3 +447,63 @@ model IdempotencyRecord {
   @@index([expiresAt])
   @@map("idempotency_records")
 }
+
+// ── Invoices ──────────────────────────────────────────────────────────────
+// Immutable documents generated once (tax invoice on payment capture, credit note on refund,
+// commission invoice and settlement statement on settlement approval). Corrections are new
+// documents that reference the original, never edits. Numbers are consecutive per kind per
+// Indian fiscal year and allocated atomically through InvoiceCounter.
+
+enum InvoiceKind {
+  TAX_INVOICE
+  CREDIT_NOTE
+  COMMISSION_INVOICE
+  SETTLEMENT_STATEMENT
+}
+
+model Invoice {
+  id                  String      @id @map("_id") @default(uuid(7))
+  /// e.g. CV-INV-2026-27-000123 (prefix from settings). Unique.
+  number              String      @unique
+  kind                InvoiceKind
+  /// "2026-27" (April–March).
+  fiscalYear          String      @map("fiscal_year")
+  sequence            Int
+  transactionId       String?     @map("transaction_id")
+  settlementBatchId   String?     @map("settlement_batch_id")
+  providerId          String      @map("provider_id")
+  patientProfileId    String?     @map("patient_profile_id")
+  issuedAt            DateTime    @map("issued_at")
+  currency            String      @default("INR")
+  subtotalMinor       BigInt      @map("subtotal_minor")
+  taxMinor            BigInt      @map("tax_minor")
+  totalMinor          BigInt      @map("total_minor")
+  /// [{ label, ratePercent, baseMinor, amountMinor }]
+  taxBreakdown        Json        @map("tax_breakdown")
+  /// Snapshot of line items at issue time: [{ description, hsnSac, quantity, unitMinor, amountMinor, taxPercent, taxMinor }]
+  lines               Json
+  /// Snapshot of seller details (platform or provider: legal name, address, GSTIN, PAN, state code).
+  seller              Json
+  /// Snapshot of buyer details (patient / provider / platform).
+  buyer               Json
+  pdfStorageKey       String      @map("pdf_storage_key")
+  pdfSha256           String      @map("pdf_sha256")
+  /// For credit notes and re-issues: the original document.
+  supersedesInvoiceId String?     @map("supersedes_invoice_id")
+  createdAt           DateTime    @default(now()) @map("created_at")
+
+  @@index([transactionId, kind])
+  @@index([settlementBatchId, kind])
+  @@index([providerId, issuedAt])
+  @@index([patientProfileId, issuedAt])
+  @@index([fiscalYear, kind, sequence])
+  @@map("invoices")
+}
+
+/// One row per kind and fiscal year: `${kind}:${fiscalYear}` → next sequence number. Updated with an atomic $inc.
+model InvoiceCounter {
+  id   String @id @map("_id")
+  next Int    @default(1)
+
+  @@map("invoice_counters")
+}
