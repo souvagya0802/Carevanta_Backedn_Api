@@ -38,6 +38,7 @@
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "9.1.0",
     "@prisma/client": "6.19.3",
+    "@types/pdfkit": "^0.17.7",
     "argon2": "0.45.1",
     "cookie-parser": "1.4.7",
     "cors": "2.8.6",
@@ -51,6 +52,7 @@
     "jose": "6.2.12",
     "mongodb": "^6.22.0",
     "nodemailer": "7.0.13",
+    "pdfkit": "^0.21.0",
     "pino": "10.4.0",
     "pino-http": "11.0.0",
     "swagger-ui-express": "5.0.1",

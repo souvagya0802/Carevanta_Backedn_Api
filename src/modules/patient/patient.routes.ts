@@ -26,7 +26,10 @@ import { advancePharmacyOrder, createPharmacyOrder, listPharmacyOrders, loadPhar
 import { loadDispatch } from '../ambulance/ambulance.routes.js';
 import { PatientUiSchema, patientUi, patientUiAdminView, type HeroImage } from './patient-ui.js';
 import { CDCI_ATTRIBUTION } from '../catalogue/cdci-import.js';
-import { medicineImageUrl } from '../catalogue/medicine-image-url.js';
+import { medicineImageCredit, medicineImageUrl } from '../catalogue/medicine-image-url.js';
+
+/** Credit for an openly licensed web photo (shown under the photo, required by CC BY). */
+const ImageCredit = { imageCredit: z.string().nullable(), imageLicence: z.string().nullable(), imageSourceUrl: z.string().nullable(), imageIsRepresentative: z.boolean() };
 import { infoSourceLine, keyParts, substituteKey, NOT_MEDICAL_ADVICE, SUBSTITUTE_NOTE } from '../catalogue/medicine-info.js';
 
 const Passthrough = z.object({}).passthrough();
@@ -326,10 +329,10 @@ export function patientRouter(): Router {
     tags: pub,
     auth: 'none',
     query: z.object({ q: z.string().trim().min(2).max(100), limit: z.coerce.number().int().min(1).max(50).default(20), ...Geo }),
-    response: z.array(z.object({ id: z.uuid(), name: z.string(), genericName: z.string().nullable(), composition: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), schedule: z.string(), pharmacies: z.number().int().describe('Same as pharmaciesTotal (kept for compatibility)'), imageUrl: z.string().nullable(), substitutes: z.number().int().describe('Other active medicines with the same salt, strength and form (capped at 50)') }).extend(Availability.shape)),
+    response: z.array(z.object({ id: z.uuid(), name: z.string(), genericName: z.string().nullable(), composition: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), schedule: z.string(), pharmacies: z.number().int().describe('Same as pharmaciesTotal (kept for compatibility)'), imageUrl: z.string().nullable(), ...ImageCredit, substitutes: z.number().int().describe('Other active medicines with the same salt, strength and form (capped at 50)') }).extend(Availability.shape)),
     handler: async ({ query }) => {
       const geo = await geoPoint(query);
-      type Row = { _id: string; name: string; generic_name?: string | null; composition?: string | null; strength?: string | null; dosage_form?: string | null; pack_size?: string | null; manufacturer?: string | null; requires_prescription: boolean; schedule: string; image_sha256?: string | null; s?: StockRow | null; substitutes: number };
+      type Row = { _id: string; name: string; generic_name?: string | null; composition?: string | null; strength?: string | null; dosage_form?: string | null; pack_size?: string | null; manufacturer?: string | null; requires_prescription: boolean; schedule: string; image_sha256?: string | null; image_credit?: string | null; image_licence?: string | null; image_source_url?: string | null; image_is_representative?: boolean | null; s?: StockRow | null; substitutes: number };
       const rows = await aggregate<Row>(prisma, 'medicines', [
         { $match: { is_active: true, $or: [{ name: contains(query.q) }, { generic_name: contains(query.q) }] } },
         { $lookup: { from: 'pharmacy_inventory', localField: '_id', foreignField: 'medicine_id', pipeline: [{ $match: inStock(stockHorizon()) }, ...stockStats(geo, null)], as: 'stock' } },
@@ -340,20 +343,20 @@ export function patientRouter(): Router {
         // Substitutes: other active medicines sharing the key (a missing key matches nothing).
         { $addFields: { ck: { $ifNull: ['$composition_key', '~none~'] } } },
         { $lookup: { from: 'medicines', localField: 'ck', foreignField: 'composition_key', pipeline: [{ $match: { is_active: true } }, { $limit: 51 }, { $project: { _id: 1 } }], as: 'subs' } },
-        { $project: { name: 1, generic_name: 1, composition: 1, strength: 1, dosage_form: 1, pack_size: 1, manufacturer: 1, requires_prescription: 1, schedule: 1, image_sha256: 1, s: 1, substitutes: { $max: [0, { $subtract: [{ $size: '$subs' }, 1] }] } } },
+        { $project: { name: 1, generic_name: 1, composition: 1, strength: 1, dosage_form: 1, pack_size: 1, manufacturer: 1, requires_prescription: 1, schedule: 1, image_sha256: 1, image_credit: 1, image_licence: 1, image_source_url: 1, image_is_representative: 1, s: 1, substitutes: { $max: [0, { $subtract: [{ $size: '$subs' }, 1] }] } } },
       ]);
       const names = geo ? await pharmacyNames(rows.map((x) => x.s?.nearest_provider)) : new Map<string, string>();
       return rows.map((x) => {
         const a = availabilityOf(x.s ?? undefined, geo, names);
-        return { id: x._id, name: x.name, genericName: x.generic_name ?? null, composition: x.composition ?? null, strength: x.strength ?? null, dosageForm: x.dosage_form ?? null, packSize: x.pack_size ?? null, manufacturer: x.manufacturer ?? null, requiresPrescription: x.requires_prescription, schedule: x.schedule, pharmacies: a.pharmaciesTotal, imageUrl: medicineImageUrl({ id: x._id, imageSha256: x.image_sha256 }), substitutes: num(x.substitutes), ...a };
+        return { id: x._id, name: x.name, genericName: x.generic_name ?? null, composition: x.composition ?? null, strength: x.strength ?? null, dosageForm: x.dosage_form ?? null, packSize: x.pack_size ?? null, manufacturer: x.manufacturer ?? null, requiresPrescription: x.requires_prescription, schedule: x.schedule, pharmacies: a.pharmaciesTotal, imageUrl: medicineImageUrl({ id: x._id, imageSha256: x.image_sha256 }), ...medicineImageCredit({ imageSha256: x.image_sha256, imageCredit: x.image_credit, imageLicence: x.image_licence, imageSourceUrl: x.image_source_url, imageIsRepresentative: x.image_is_representative }), substitutes: num(x.substitutes), ...a };
       });
     },
   });
 
-  const SubstituteDto = z.object({ id: z.uuid(), name: z.string(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), imageUrl: z.string().nullable(), savingsMinor: z.number().int().nullable().describe('How much less than this medicine at the lowest prices (null when not cheaper or unknown)'), savingsPercent: z.number().int().nullable() }).extend(Availability.shape);
+  const SubstituteDto = z.object({ id: z.uuid(), name: z.string(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), requiresPrescription: z.boolean(), imageUrl: z.string().nullable(), imageIsRepresentative: z.boolean(), savingsMinor: z.number().int().nullable().describe('How much less than this medicine at the lowest prices (null when not cheaper or unknown)'), savingsPercent: z.number().int().nullable() }).extend(Availability.shape);
   const MedicineDetail = z.object({
     id: z.uuid(), name: z.string(), genericName: z.string().nullable(), composition: z.string().nullable(), strength: z.string().nullable(), dosageForm: z.string().nullable(), packSize: z.string().nullable(), manufacturer: z.string().nullable(), route: z.string().nullable(),
-    schedule: z.string(), requiresPrescription: z.boolean(), source: z.string(), compositionKey: z.string().nullable(), imageUrl: z.string().nullable(),
+    schedule: z.string(), requiresPrescription: z.boolean(), source: z.string(), compositionKey: z.string().nullable(), imageUrl: z.string().nullable(), ...ImageCredit,
     therapeuticClass: z.string().nullable(), uses: z.string().nullable(), howItWorks: z.string().nullable(), sideEffects: z.string().nullable(), contraindications: z.string().nullable(), interactions: z.string().nullable(), precautions: z.string().nullable(), storage: z.string().nullable(),
     infoSource: z.string().nullable(), infoUpdatedAt: z.string().nullable(), infoSourceLine: z.string().nullable().describe('"Information from CDCI, Government of India" or "Reviewed by Carevanta"'), disclaimer: z.string(), attribution: z.string().nullable(),
     availability: Availability,
@@ -399,7 +402,7 @@ export function patientRouter(): Router {
         || (priceOf(a.id) ?? Number.MAX_SAFE_INTEGER) - (priceOf(b.id) ?? Number.MAX_SAFE_INTEGER)
         || a.name.localeCompare(b.name)).slice(0, 20);
       const [details, names] = await Promise.all([
-        prisma.medicine.findMany({ where: { id: { in: ranked.map((x) => x.id) } }, select: { id: true, name: true, strength: true, dosageForm: true, packSize: true, manufacturer: true, requiresPrescription: true, imageSha256: true } }),
+        prisma.medicine.findMany({ where: { id: { in: ranked.map((x) => x.id) } }, select: { id: true, name: true, strength: true, dosageForm: true, packSize: true, manufacturer: true, requiresPrescription: true, imageSha256: true, imageIsRepresentative: true } }),
         pharmacyNames([m.id, ...ranked.map((x) => x.id)].map((id) => statBy.get(id)?.nearest_provider)),
       ]);
       const detailBy = new Map(details.map((d) => [d.id, d]));
@@ -407,7 +410,7 @@ export function patientRouter(): Router {
       const leading = (s: string | null | undefined) => { const n = parseFloat((s ?? '').replace(/[^\d.]+/u, ' ').trim()); return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER; };
       return {
         id: m.id, name: m.name, genericName: m.genericName, composition: m.composition, strength: m.strength, dosageForm: m.dosageForm, packSize: m.packSize, manufacturer: m.manufacturer, route: m.route,
-        schedule: m.schedule, requiresPrescription: m.requiresPrescription, source: m.source, compositionKey: key, imageUrl: medicineImageUrl(m),
+        schedule: m.schedule, requiresPrescription: m.requiresPrescription, source: m.source, compositionKey: key, imageUrl: medicineImageUrl(m), ...medicineImageCredit(m),
         therapeuticClass: m.therapeuticClass, uses: m.uses, howItWorks: m.howItWorks, sideEffects: m.sideEffects, contraindications: m.contraindications, interactions: m.interactions, precautions: m.precautions, storage: m.storage,
         infoSource: m.infoSource, infoUpdatedAt: iso(m.infoUpdatedAt), infoSourceLine: infoSourceLine(m.infoSource), disclaimer: NOT_MEDICAL_ADVICE, attribution: m.source === 'CDCI' ? CDCI_ATTRIBUTION : null,
         availability: availabilityOf(statBy.get(m.id), geo, names),
@@ -415,7 +418,7 @@ export function patientRouter(): Router {
           const d = detailBy.get(x.id)!;
           const price = priceOf(x.id);
           const save = basePrice != null && price != null && price < basePrice ? basePrice - price : null;
-          return { id: d.id, name: d.name, strength: d.strength, dosageForm: d.dosageForm, packSize: d.packSize, manufacturer: d.manufacturer, requiresPrescription: d.requiresPrescription, imageUrl: medicineImageUrl(d), savingsMinor: save, savingsPercent: save != null ? Math.round((save * 100) / basePrice!) : null, ...availabilityOf(statBy.get(x.id), geo, names) };
+          return { id: d.id, name: d.name, strength: d.strength, dosageForm: d.dosageForm, packSize: d.packSize, manufacturer: d.manufacturer, requiresPrescription: d.requiresPrescription, imageUrl: medicineImageUrl(d), imageIsRepresentative: medicineImageCredit(d).imageIsRepresentative, savingsMinor: save, savingsPercent: save != null ? Math.round((save * 100) / basePrice!) : null, ...availabilityOf(statBy.get(x.id), geo, names) };
         }),
         substitutesTotal: subsAll.length,
         substituteNote: SUBSTITUTE_NOTE,

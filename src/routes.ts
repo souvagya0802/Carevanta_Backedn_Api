@@ -9,6 +9,7 @@ import { affiliationsRouter } from './modules/affiliations/affiliations.routes.j
 import { appointmentsRouter } from './modules/appointments/appointments.routes.js';
 import { financeRouter } from './modules/finance/finance.routes.js';
 import { manualFinanceRouter } from './modules/finance/manual.routes.js';
+import { invoicesRouter } from './modules/finance/invoices/invoices.routes.js';
 import { diagnosticsRouter } from './modules/diagnostics/diagnostics.routes.js';
 import { pharmacyRouter } from './modules/pharmacy/pharmacy.routes.js';
 import { ambulanceRouter } from './modules/ambulance/ambulance.routes.js';
@@ -41,6 +42,7 @@ export function apiRouter(): Router {
   r.use(appointmentsRouter());
   r.use(financeRouter());
   r.use(manualFinanceRouter());
+  r.use(invoicesRouter());
   r.use(diagnosticsRouter());
   r.use(pharmacyRouter());
   r.use(ambulanceRouter());

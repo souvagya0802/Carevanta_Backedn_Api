@@ -7,6 +7,7 @@ import { makeReference, REF } from '../../lib/reference.js';
 import { logger } from '../../lib/logger.js';
 import { getGateway, type LiveGateway } from './gateway.js';
 import { onRefundSucceeded } from './commission.service.js';
+import { ensureTransactionInvoicesSafe } from './invoices/invoices.service.js';
 import type { AuthContext } from '../../middleware/auth.js';
 
 /** Create a gateway order for the outstanding amount of a transaction. */
@@ -204,6 +205,7 @@ async function applyStoredEvent(gateway: LiveGateway, storedId: string, eventId:
       await tx.paymentWebhookEvent.update({ where: { id: stored.id }, data: { processingStatus: outcome, processedAt: new Date(), processingError: null } });
       return { duplicate: false, status: outcome };
     });
+    if (result.status === 'PROCESSED' && !result.duplicate) await issueInvoicesAfterEvent(gateway, event);
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -216,6 +218,19 @@ async function applyStoredEvent(gateway: LiveGateway, storedId: string, eventId:
     await prisma.paymentWebhookEvent.update({ where: { id: stored.id }, data: { processingStatus: 'FAILED', processingError: message.slice(0, 1000) } });
     logger.warn({ eventId, err: message }, 'webhook processing failed');
     return { duplicate: false, status: 'FAILED' as const };
+  }
+}
+
+/** After a capture or refund is applied: issue the tax invoice / credit note (outside the DB transaction; never throws). */
+async function issueInvoicesAfterEvent(gateway: LiveGateway, event: RazorpayEvent) {
+  const pay = event.payload?.payment?.entity;
+  const ref = event.payload?.refund?.entity;
+  if ((event.event === 'payment.captured' || event.event === 'order.paid') && pay) {
+    const p = await prisma.payment.findUnique({ where: { gateway_gatewayOrderId: { gateway, gatewayOrderId: pay.order_id } }, select: { transactionId: true } });
+    await ensureTransactionInvoicesSafe(p?.transactionId);
+  } else if (event.event === 'refund.processed' && ref) {
+    const r = await prisma.refund.findUnique({ where: { gatewayRefundId: ref.id }, select: { transactionId: true } });
+    await ensureTransactionInvoicesSafe(r?.transactionId);
   }
 }
 

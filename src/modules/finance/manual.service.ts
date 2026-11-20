@@ -3,6 +3,7 @@ import { prisma, transactionWithRetry, lockTransaction } from '../../lib/prisma.
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, isPgError, notFound, separationOfDuties } from '../../lib/errors.js';
 import { onRefundSucceeded, post } from './commission.service.js';
+import { ensureTransactionInvoicesSafe } from './invoices/invoices.service.js';
 import type { AuthContext } from '../../middleware/auth.js';
 
 /**
@@ -36,7 +37,7 @@ export async function recordManualPayment(
   input: { receivedBy: 'PLATFORM' | 'PROVIDER'; amountMinor: bigint; method: ManualMethod; reference?: string; receivedAt: Date; note: string },
 ) {
   if (input.receivedAt.getTime() > Date.now() + 5 * 60_000) throw badRequest('receivedAt cannot be in the future');
-  return transactionWithRetry(async (tx) => {
+  const out = await transactionWithRetry(async (tx) => {
     await lockTransaction(tx, transactionId);
     const txn = await tx.serviceTransaction.findUnique({ where: { id: transactionId }, include: { payments: true } });
     if (!txn) throw notFound('Transaction');
@@ -89,6 +90,8 @@ export async function recordManualPayment(
     await audit(tx, { action: 'payment.recorded_manually', entityType: 'payment', entityId: payment.id, actorUserId: actor.userId, metadata: { transactionId: txn.id, amountMinor: input.amountMinor.toString(), method: input.method, reference: input.reference ?? null, receivedAt: input.receivedAt.toISOString(), note: input.note, transactionStatus: status } });
     return { transactionId: txn.id, status, paymentId: payment.id };
   });
+  if (out.status === 'PAID') await ensureTransactionInvoicesSafe(out.transactionId);
+  return out;
 }
 
 /** An abandoned online checkout (still CREATED at the gateway) is closed so another payment can be recorded. */
@@ -110,7 +113,7 @@ export async function markPaymentAbandoned(actor: AuthContext, paymentId: string
  */
 export async function recordManualRefund(actor: AuthContext, refundId: string, input: { method: ManualMethod; reference?: string; processedAt: Date; note: string }) {
   if (input.processedAt.getTime() > Date.now() + 5 * 60_000) throw badRequest('processedAt cannot be in the future');
-  return transactionWithRetry(async (tx) => {
+  const done = await transactionWithRetry(async (tx) => {
     const refund = await tx.refund.findUnique({ where: { id: refundId } });
     if (!refund) throw notFound('Refund');
     if (!['REQUESTED', 'APPROVED', 'FAILED'].includes(refund.status)) throw conflict(`Refund is ${refund.status}; only requested, approved or failed refunds can be recorded manually`);
@@ -126,6 +129,8 @@ export async function recordManualRefund(actor: AuthContext, refundId: string, i
     await audit(tx, { action: 'refund.recorded_manually', entityType: 'refund', entityId: refund.id, actorUserId: actor.userId, metadata: { amountMinor: refund.amountMinor.toString(), method: input.method, reference: input.reference ?? null, processedAt: input.processedAt.toISOString(), note: input.note, previousStatus: refund.status } });
     return tx.refund.findUniqueOrThrow({ where: { id: refund.id } });
   });
+  await ensureTransactionInvoicesSafe(done.transactionId);
+  return done;
 }
 
 /**

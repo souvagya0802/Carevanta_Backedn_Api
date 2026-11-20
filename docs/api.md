@@ -89,3 +89,26 @@ A ready-to-import Postman collection can be generated from `docs/openapi.json` (
 ## Versioning
 
 Breaking changes go under `/api/v2`; additive changes (new optional fields, new endpoints) ship under `/api/v1`. The OpenAPI document is regenerated in CI so the committed file always matches the code.
+
+## Invoices
+
+Immutable PDF documents (pdfkit, A4, platform logo top-left or the platform name when no PNG/JPEG logo is set). Numbers look like `CV-INV-2026-27-000001`: prefix from `invoice.number_prefix`, kind code (`INV` tax invoice, `CRN` credit note, `COM` commission invoice, `STM` settlement statement), Indian fiscal year (April–March, IST), six-digit sequence allocated atomically per kind per year (`invoice_counters`, one findAndModify). Corrections are credit notes; nothing is edited.
+
+**InvoiceMeta**: `{ id, number, kind, issuedAt, currency, totalMinor, taxMinor, sourceType, sourceId, transactionId, providerId, patientProfileId, pdfUrl }`.
+
+| Route | Auth |
+|---|---|
+| `GET /invoices/:id` | Patient account holder of the invoice's profile, active provider member with `view_finance` for the invoice's provider, or `finance.read`. 404 unknown, 403 otherwise. |
+| `GET /invoices/:id/pdf` | Same. `application/pdf`, `Content-Disposition: attachment; filename="<number>.pdf"`, `Cache-Control: private, no-store`. |
+| `GET /patient/invoices?limit&cursor` | Signed-in patient: tax invoices and credit notes of every profile on the account, newest first (standard list envelope `data[]` + `page`). |
+| `GET /patient/transactions/:transactionId/invoices` | Account holder of the transaction → `{ items }`. |
+| `GET /portal/providers/:providerId/invoices?limit&cursor&kind` | `view_finance` member of that provider or `finance.read`; newest first. |
+| `GET /portal/providers/:providerId/transactions/:transactionId/invoices` | Same; the transaction must belong to the provider → `{ items }`. |
+| `GET /portal/providers/:providerId/settlements/:batchId/invoices` | Same → `{ items }` (commission invoice + statement; empty until those are generated). |
+| `GET /admin/finance/transactions/:transactionId/invoices` | `finance.read` → `{ items }`. |
+| `GET /admin/finance/settlements/:batchId/invoices` | `finance.read` → `{ items }`. |
+| `GET /admin/finance/invoices/sample.pdf` | `finance.read`. Sample tax invoice with the current `invoice.*` settings and logo; not stored or numbered. |
+| `POST /admin/finance/transactions/:transactionId/invoices/regenerate-missing` | `finance.manual.record`, audited → `{ transactions, created }`. |
+| `POST /admin/finance/invoices/regenerate-missing` | `finance.manual.record`, audited; backfills every PAID / PARTIALLY_REFUNDED / REFUNDED transaction. |
+
+Generation: a tax invoice when a transaction becomes PAID (gateway webhook or a manual payment received by the platform); a credit note per succeeded refund (webhook or manual record), referencing the original via `supersedesInvoiceId`. Generation runs after the database transaction commits and never fails the payment flow; a failure is logged and fixed by regenerate-missing. Idempotency: partial unique indexes `invoices_one_tax_invoice_per_txn`, `invoices_one_credit_note_per_refund` (refund id in the line snapshot), `invoices_one_per_batch_provider_kind`. Transactions paid at the provider (PAY_AT_PROVIDER) get no platform invoice.

@@ -37,3 +37,14 @@ For each check the officer records `method`, a `sourceReference` (registry URL/s
 ## Re-verification
 
 Nightly job (`maintenance.credential-expiry`) expires documents, suspends providers whose required licence/registration lapsed, grounds vehicles with expired insurance/fitness, and opens RENEWAL verification cases; a reminder case is opened 30 days ahead.
+
+## Invoices and GST (assumptions needing legal / CA review)
+
+- **Marketplace model.** Patient invoices name the provider as the supplier and the platform (`invoice.seller_*` settings) as the facilitator. Whether the platform must instead issue the invoice as an e-commerce operator (CGST s.9(5) / TCS under s.52) needs confirmation.
+- **Healthcare exemption.** Consultation, diagnostics and ambulance lines are printed as GST-exempt (healthcare services by a clinical establishment, Notification 12/2017-CT(R) entry 74). There is no per-service or per-provider override yet; non-exempt services (e.g. cosmetic procedures) would need one.
+- **Medicines.** No per-line GST rate is stored, so medicine invoices say "MRP inclusive of GST" with no tax split. A pharmacy GST invoice with HSN and rate per line needs the rate in the catalogue.
+- **HSN/SAC** is printed blank where not known.
+- **Commission GST** (`invoice.commission_gst_percent`, default 18%) applies to commission invoices (platform → provider), which are not generated yet.
+- **Number series.** Consecutive per kind per fiscal year, atomically allocated. A number can be left unused if two generators race for the same transaction (the loser's number is skipped); GST rules expect a consecutive series, so confirm whether such gaps must be recorded as cancelled numbers.
+- **Place of supply** is taken from the provider's primary location state; seller state code comes from settings.
+- Credit notes are issued per refund and reference the original invoice; no GST adjustment is shown because the original lines carry no tax.

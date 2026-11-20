@@ -57,6 +57,9 @@ const EnvSchema = z
     // Blank lines in .env (as in .env.example) count as "not set".
     GEOCODER_API_KEY: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(8).optional()),
     GEOCODER_CONTACT_EMAIL: z.preprocess((v) => (v === '' ? undefined : v), z.string().email().optional()),
+    // Openverse (openly licensed medicine photos): optional registered client; blank = anonymous (20/min, 200/day).
+    OPENVERSE_CLIENT_ID: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(4).optional()),
+    OPENVERSE_CLIENT_SECRET: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(4).optional()),
 
     // Redis (optional): backs the per-slot booking lock so API instances agree on who books a contested slot.
     // Unset/blank → in-process lock, correct for ONE instance only; set it before running two or more.

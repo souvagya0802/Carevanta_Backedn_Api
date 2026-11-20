@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit.js';
 import { aggregate, ejsonDate } from '../../lib/mongo.js';
 import { badRequest, conflict, notFound } from '../../lib/errors.js';
 import { dedupeKey, normaliseSpace, searchKey, titleCase } from './cdci-parse.js';
-import { medicineImageUrl } from './medicine-image-url.js';
+import { medicineImageCredit, medicineImageUrl } from './medicine-image-url.js';
 
 /**
  * "Same salt, same strength, same form" keys come from one place (medicine-info.ts), so the CDCI
@@ -15,11 +15,12 @@ import { compositionKey } from './medicine-info.js';
 export { compositionKey, substituteKey } from './medicine-info.js';
 
 /** Fields the portal picker shows for a medicine. */
-export function pickerDto(m: { id: string; name: string; composition: string | null; genericName: string | null; strength: string | null; dosageForm: string | null; packSize: string | null; manufacturer: string | null; schedule: string; requiresPrescription: boolean; source: string; code: string | null; imageSha256?: string | null; imageSource?: string | null; imageUpdatedByProviderId?: string | null }) {
+export function pickerDto(m: { id: string; name: string; composition: string | null; genericName: string | null; strength: string | null; dosageForm: string | null; packSize: string | null; manufacturer: string | null; schedule: string; requiresPrescription: boolean; source: string; code: string | null; imageSha256?: string | null; imageSource?: string | null; imageUpdatedByProviderId?: string | null; imageCredit?: string | null; imageLicence?: string | null; imageSourceUrl?: string | null; imageIsRepresentative?: boolean | null }) {
   return {
     id: m.id, name: m.name, composition: m.composition, genericName: m.genericName, strength: m.strength, dosageForm: m.dosageForm, packSize: m.packSize, manufacturer: m.manufacturer, schedule: m.schedule, requiresPrescription: m.requiresPrescription, source: m.source, code: m.code,
     // Photo: the portal shows Add / Change / "Set by Carevanta" from these.
     imageUrl: medicineImageUrl(m),
+    ...medicineImageCredit(m),
     imageSource: m.imageSha256 ? (m.imageSource ?? null) : null,
     imageProviderId: m.imageSha256 && m.imageSource === 'PROVIDER' ? (m.imageUpdatedByProviderId ?? null) : null,
   };

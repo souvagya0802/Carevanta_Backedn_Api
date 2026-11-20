@@ -55,6 +55,10 @@ export const PARTIAL_INDEXES: IndexSpec[] = [
   // finance
   { collection: 'service_transactions', name: 'service_transactions_completed_at_partial', key: { service_completed_at: 1 }, partialFilterExpression: { service_completed_at: { $type: 'date' } } },
   { collection: 'commission_snapshots', name: 'commission_snapshots_one_live', key: { transaction_id: 1 }, unique: true, partialFilterExpression: { status: { $in: ['PROVISIONAL', 'FINAL'] } } },
+  // invoices: one tax invoice per transaction, one credit note per refund (refund id is in the line snapshot), one document per kind per provider per settlement batch
+  { collection: 'invoices', name: 'invoices_one_tax_invoice_per_txn', key: { transaction_id: 1, kind: 1 }, unique: true, partialFilterExpression: { transaction_id: { $type: 'string' }, kind: 'TAX_INVOICE' } },
+  { collection: 'invoices', name: 'invoices_one_credit_note_per_refund', key: { 'lines.refundId': 1 }, unique: true, partialFilterExpression: { kind: 'CREDIT_NOTE', 'lines.refundId': { $type: 'string' } } },
+  { collection: 'invoices', name: 'invoices_one_per_batch_provider_kind', key: { settlement_batch_id: 1, provider_id: 1, kind: 1 }, unique: true, partialFilterExpression: { settlement_batch_id: { $type: 'string' } } },
   { collection: 'provider_ledger_entries', name: 'ledger_unsettled_by_provider', key: { provider_id: 1, created_at: 1 }, partialFilterExpression: isNull('settlement_item_id') },
   // medicines: one row per CDCI brand code (manual and provider-proposed rows have no code)
   { collection: 'medicines', name: 'medicines_code_unique_partial', key: { code: 1 }, unique: true, partialFilterExpression: { code: { $type: 'string' } } },

@@ -11,7 +11,7 @@ import { clearSearchVocabulary } from '../discovery/smart-search.js';
 import { searchKey } from './cdci-parse.js';
 import { bulkUpdateMedicines, BulkInput, substituteKey, findDuplicates, InfoInput, medicineDetail, medicineFilterWhere, medicineHistory, MedicineListFilters, medicineOverview, medicineStock, medicineSubstitutes, mergeMedicine, restoreGovernmentInfo, stockedCounts, updateMedicineInfo } from './medicines.service.js';
 import type { Medicine } from '../../../generated/prisma/client.js';
-import { medicineImageUrl } from './medicine-image-url.js';
+import { medicineImageCredit, medicineImageUrl } from './medicine-image-url.js';
 
 /** Everyday words patients type for a speciality or test. Lowercase, de-duplicated. */
 const Synonyms = z.array(z.string().trim().toLowerCase().min(2).max(120)).max(40).transform((xs) => [...new Set(xs)]);
@@ -622,10 +622,14 @@ export function catalogueRouter(): Router {
     imageUrl: z.string().nullable().optional(),
     imageSource: z.string().nullable().optional(),
     imageUpdatedAt: z.string().nullable().optional(),
+    imageCredit: z.string().nullable().optional(),
+    imageLicence: z.string().nullable().optional(),
+    imageSourceUrl: z.string().nullable().optional(),
+    imageIsRepresentative: z.boolean().optional(),
     /** List only: pharmacies holding sellable stock. */
     stockedAt: z.number().int().optional(),
   });
-  const medicineDto = (m: Medicine) => ({ ...m, createdAt: m.createdAt.toISOString(), infoUpdatedAt: m.infoUpdatedAt?.toISOString() ?? null, imageUpdatedAt: m.imageUpdatedAt?.toISOString() ?? null, imageUrl: medicineImageUrl(m), imageKey: undefined, updatedAt: undefined });
+  const medicineDto = (m: Medicine) => ({ ...m, createdAt: m.createdAt.toISOString(), infoUpdatedAt: m.infoUpdatedAt?.toISOString() ?? null, imageUpdatedAt: m.imageUpdatedAt?.toISOString() ?? null, imageUrl: medicineImageUrl(m), ...medicineImageCredit(m), imageKey: undefined, updatedAt: undefined });
   const ScheduleEnum = z.enum(['OTC', 'SCHEDULE_G', 'SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X', 'OTHER']);
   const RX_SCHEDULES = ['SCHEDULE_H', 'SCHEDULE_H1', 'SCHEDULE_X'];
 

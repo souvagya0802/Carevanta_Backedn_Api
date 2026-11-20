@@ -1026,7 +1026,7 @@ export function portalRouter(): Router {
       await assertProviderAccess(auth, params.providerId, { platformPermission: 'finance.read', capability: 'view_finance' });
       const rows = await prisma.settlementItem.findMany({ where: { providerId: params.providerId, ...cursorWhere(query.cursor) }, include: { batch: { select: { reference: true, status: true, periodEnd: true } } }, orderBy: cursorOrderBy(), take: query.limit + 1 });
       const { items, page } = buildPage(rows, query.limit, (i) => i.createdAt);
-      return { page, items: items.map((i) => ({ id: i.id, batchReference: i.batch.reference, batchStatus: i.batch.status, periodEnd: i.batch.periodEnd.toISOString(), amountMinor: minor(i.amountMinor)!, status: i.status, payoutReference: i.payoutReference, paidAt: iso(i.paidAt), failureReason: i.failureReason, createdAt: i.createdAt.toISOString() })) };
+      return { page, items: items.map((i) => ({ id: i.id, batchId: i.batchId, batchReference: i.batch.reference, batchStatus: i.batch.status, periodEnd: i.batch.periodEnd.toISOString(), amountMinor: minor(i.amountMinor)!, status: i.status, payoutReference: i.payoutReference, paidAt: iso(i.paidAt), failureReason: i.failureReason, createdAt: i.createdAt.toISOString() })) };
     },
   });
 
